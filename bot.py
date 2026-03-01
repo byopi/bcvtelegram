@@ -1,21 +1,21 @@
 import os
 import requests
+import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
-from datetime import datetime
 
-# El token se lee de las variables de entorno de Render
+# Token desde variables de entorno
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = Bot(token=TOKEN)
 app = Flask(__name__)
 
-# Configuración del bot
+# Configuración de la aplicación
 application = Application.builder().token(TOKEN).build()
 
+# Función para obtener tasas
 def obtener_tasas():
     try:
-        # API de DolarAPI para BCV
         res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
         res_euro = requests.get("https://pydolarve.org/api/v1/euro?monitor=bcv").json()
         return {
@@ -25,7 +25,8 @@ def obtener_tasas():
     except:
         return None
 
-# Comandos
+# --- COMANDOS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mensaje = ("¡Gracias por iniciarme!, puedes ver la tasa BCV del día de hoy a través de mis comando /bcv, "
                "y calcular cuanto es en bolívares cierta cantidad de dolares a través de /calcular")
@@ -61,17 +62,17 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# Webhook para Render
+# --- INICIALIZACIÓN ---
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.run_until_complete(application.initialize())
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    import asyncio
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run(application.process_update(update))
+    json_data = request.get_json(force=True)
+    update = Update.de_json(json_data, bot)
+    loop.run_until_complete(application.process_update(update))
     return "OK", 200
-
-@app.route('/')
-def index():
-    return "Bot activo", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
