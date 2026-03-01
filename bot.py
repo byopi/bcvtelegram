@@ -8,30 +8,66 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 bot = Bot(token=TOKEN)
 app = Flask(__name__)
 
-# Configuración básica
+# Configuración de la aplicación
 application = Application.builder().token(TOKEN).build()
 
-# --- COMANDOS (Sin cambios) ---
-async def start(update, context):
-    await update.message.reply_text("¡Gracias por iniciarme! Usa /bcv o /calcular.")
+# Función para obtener tasas desde la API
+def obtener_tasas():
+    try:
+        res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
+        res_euro = requests.get("https://pydolarve.org/api/v1/euro?monitor=bcv").json()
+        return {
+            "dolar": res_dolar['monitors']['bcv']['price'],
+            "euro": res_euro['monitors']['bcv']['price']
+        }
+    except:
+        return None
 
-async def bcv(update, context):
-    # Simulación rápida para probar que el comando responde
-    await update.message.reply_text("TASAS DEL DÍA\n\n🇪🇺 Euro: 40.0 Bs.\n🇺🇸 Dolar: 38.0 Bs.")
+# --- COMANDOS ---
 
-async def calcular(update, context):
-    await update.message.reply_text("Cálculo recibido.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensaje = ("¡Gracias por iniciarme!, puedes ver la tasa BCV del día de hoy a través de mis comando /bcv, "
+               "y calcular cuanto es en bolívares cierta cantidad de dolares a través de /calcular")
+    await update.message.reply_text(mensaje)
 
+async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasas = obtener_tasas()
+    if not tasas:
+        await update.message.reply_text("Error al conectar con el BCV.")
+        return
+    
+    # Formato solicitado
+    mensaje = (f"TASAS DEL DÍA\n\n"
+               f"🇪🇺 Euro: {tasas['euro']} Bs.\n"
+               f"🇺🇸 Dolar: {tasas['dolar']} Bs.")
+    await update.message.reply_text(mensaje)
+
+async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Uso: /calcular [cantidad]")
+        return
+    
+    try:
+        cantidad = float(context.args[0].replace(',', '.'))
+        tasas = obtener_tasas()
+        tasa_dolar = float(str(tasas['dolar']).replace(',', '.'))
+        total = cantidad * tasa_dolar
+        # Formato solicitado
+        await update.message.reply_text(f"{cantidad}$ en bolívares serían: Bs. {total:,.2f}")
+    except:
+        await update.message.reply_text("Error: Asegúrate de ingresar un número válido.")
+
+# Registrar comandos
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# --- RUTA WEBHOOK CORREGIDA ---
+# --- WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Usamos request directamente para obtener los datos
+    # Recibe el mensaje de Telegram
     update = Update.de_json(request.get_json(force=True), bot)
-    # Ejecutamos el procesador de forma que no bloquee el hilo de Flask
+    # Lo pone en la cola para que el bot lo procese
     application.update_queue.put(update)
     return "OK", 200
 
@@ -40,5 +76,4 @@ def index():
     return "Bot activo", 200
 
 if __name__ == '__main__':
-    # Esto es solo para pruebas locales; en Render usa gunicorn
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
