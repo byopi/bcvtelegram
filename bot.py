@@ -1,18 +1,15 @@
 import os
 import requests
-import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-bot = Bot(token=TOKEN)
 app = Flask(__name__)
 
-# Configuración de la aplicación
+# --- INICIALIZACIÓN FUERA DE LAS RUTAS ---
 application = Application.builder().token(TOKEN).build()
 
-# Función para obtener tasas
 def obtener_tasas():
     try:
         res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
@@ -24,61 +21,40 @@ def obtener_tasas():
     except:
         return None
 
-# --- COMANDOS ---
+async def start(update, context):
+    await update.message.reply_text("¡Gracias por iniciarme! Usa /bcv o /calcular.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensaje = ("¡Gracias por iniciarme!, puedes ver la tasa BCV del día de hoy a través de mis comando /bcv, "
-               "y calcular cuanto es en bolívares cierta cantidad de dolares a través de /calcular")
-    await update.message.reply_text(mensaje)
-
-async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bcv(update, context):
     tasas = obtener_tasas()
-    if not tasas:
-        await update.message.reply_text("Error al obtener las tasas.")
-        return
-    
-    mensaje = (f"TASAS DEL DÍA\n\n"
-               f"🇪🇺 Euro: {tasas['euro']} Bs.\n"
-               f"🇺🇸 Dolar: {tasas['dolar']} Bs.")
-    await update.message.reply_text(mensaje)
+    if tasas:
+        await update.message.reply_text(f"TASAS DEL DÍA\n\n🇪🇺 Euro: {tasas['euro']} Bs.\n🇺🇸 Dolar: {tasas['dolar']} Bs.")
 
-async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Uso: /calcular [cantidad]")
-        return
-    
+async def calcular(update, context):
     try:
         cantidad = float(context.args[0].replace(',', '.'))
         tasas = obtener_tasas()
-        tasa_dolar = float(str(tasas['dolar']).replace(',', '.'))
-        total = cantidad * tasa_dolar
+        total = cantidad * float(str(tasas['dolar']).replace(',', '.'))
         await update.message.reply_text(f"{cantidad}$ en bolívares serían: Bs. {total:,.2f}")
     except:
-        await update.message.reply_text("Error: Asegúrate de ingresar un número válido.")
+        await update.message.reply_text("Usa /calcular [cantidad]")
 
-# Registrar comandos
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# --- INICIALIZACIÓN ---
+# --- INICIALIZACIÓN CRÍTICA PARA GUNICORN ---
+import asyncio
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 loop.run_until_complete(application.initialize())
+loop.run_until_complete(application.start())
 
-# --- RUTAS WEB ---
 @app.route('/')
 def index():
     return "Bot activo", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    json_data = request.get_json(force=True)
-    update = Update.de_json(json_data, bot)
+    update = Update.de_json(request.get_json(force=True), application.bot)
     loop.run_until_complete(application.process_update(update))
     return "OK", 200
-
-if __name__ == '__main__':
-    # Usar el puerto que asigna Render
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
