@@ -1,86 +1,148 @@
 import os
+import re
+import logging
 import requests
-import asyncio
-from flask import Flask, request
+from bs4 import BeautifulSoup
+from datetime import datetime
 from telegram import Update
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- INICIALIZACIÓN ---
-# Creamos el loop global para mantener el contexto
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
+# Cache para las tasas
+_cache = {
+    "rates": None,
+    "timestamp": None
+}
 
-# Inicializamos la aplicación
-application = Application.builder().token(TOKEN).build()
+CACHE_SECONDS = 300  # 5 minutos
 
-# Función con timeout para no bloquear el bot
-def obtener_tasas():
+
+def fetch_bcv_rates():
+    """Obtiene las tasas del BCV scrapeando su web oficial."""
+    now = datetime.now()
+    if _cache["rates"] and _cache["timestamp"]:
+        diff = (now - _cache["timestamp"]).total_seconds()
+        if diff < CACHE_SECONDS:
+            return _cache["rates"]
+
     try:
-        # Timeout de 3 segundos para evitar bloqueos
-        res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv", timeout=3).json()
-        res_euro = requests.get("https://pydolarve.org/api/v1/euro?monitor=bcv", timeout=3).json()
-        return {
-            "dolar": res_dolar['monitors']['bcv']['price'], 
-            "euro": res_euro['monitors']['bcv']['price']
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-    except:
-        return None
+        response = requests.get("https://www.bcv.org.ve/", headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
 
-# --- COMANDOS ---
-async def start(update, context):
-    await update.message.reply_text("¡Bot activo! Usa /bcv o /calcular [cantidad].")
+        rates = {}
 
-async def bcv(update, context):
-    tasas = obtener_tasas()
-    if tasas:
-        await update.message.reply_text(f"TASAS DEL DÍA\n\n🇪🇺 Euro: {tasas['euro']} Bs.\n🇺🇸 Dolar: {tasas['dolar']} Bs.\n")
-    else:
-        await update.message.reply_text("Error al obtener las tasas, intenta de nuevo.")
+        # Dolar
+        dolar_div = soup.find("div", {"id": "dolar"})
+        if dolar_div:
+            strong = dolar_div.find("strong")
+            if strong:
+                rates["USD"] = float(strong.text.strip().replace(",", "."))
 
-async def calcular(update, context):
-    if not context.args:
-        await update.message.reply_text("Uso: /calcular [cantidad]")
-        return
-    try:
-        cant = float(context.args[0].replace(',', '.'))
-        tasas = obtener_tasas()
-        if tasas:
-            tasa = float(str(tasas['dolar']).replace(',', '.'))
-            total = cant * tasa
-            await update.message.reply_text(f"{cant}$ son {total:,.2f} Bs.")
+        # Euro
+        euro_div = soup.find("div", {"id": "euro"})
+        if euro_div:
+            strong = euro_div.find("strong")
+            if strong:
+                rates["EUR"] = float(strong.text.strip().replace(",", "."))
+
+        if rates:
+            _cache["rates"] = rates
+            _cache["timestamp"] = now
+            return rates
         else:
-            await update.message.reply_text("No pude obtener la tasa para calcular.")
-    except:
-        await update.message.reply_text("Error: Asegúrate de ingresar un número.")
+            return None
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("bcv", bcv))
-application.add_handler(CommandHandler("calcular", calcular))
+    except Exception as e:
+        logger.error(f"Error fetching BCV rates: {e}")
+        return _cache["rates"]  # devolver caché viejo si hay error
 
-# --- INICIALIZACIÓN DE LA APP ---
-loop.run_until_complete(application.initialize())
 
-# --- RUTAS WEB ---
-@app.route('/')
-def index():
-    return "Bot activo", 200
+def get_date_str():
+    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    now = datetime.now()
+    return f"{now.day} de {meses[now.month - 1]} de {now.year}"
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    # Recibimos el update de Telegram
-    data = request.get_json(force=True)
-    update = Update.de_json(data, application.bot)
-    
-    # Procesamos en segundo plano para responder "OK" a Telegram inmediatamente
-    # y evitar el error de TimedOut
-    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
-    
-    return "OK", 200
 
-if __name__ == '__main__':
-    # Usar el puerto 10000 o el que asigne Render
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través de mis comandos /bcv, "
+        "y calcular cuánto es en bolívares cierta cantidad de dólares a través de /calcular"
+    )
+
+
+async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rates = fetch_bcv_rates()
+    if not rates:
+        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
+        return
+
+    usd = rates.get("USD", "N/A")
+    eur = rates.get("EUR", "N/A")
+
+    usd_str = f"{usd:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if isinstance(usd, float) else usd
+    eur_str = f"{eur:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if isinstance(eur, float) else eur
+
+    msg = (
+        f"*TASAS DEL DÍA*\n"
+        f"📅 {get_date_str()}\n\n"
+        f"🇪🇺 Euro: Bs. {eur_str}\n"
+        f"🇺🇸 Dólar: Bs. {usd_str}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Por favor indica la cantidad. Ejemplo: /calcular 20")
+        return
+
+    try:
+        cantidad = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ El valor ingresado no es válido. Ejemplo: /calcular 20")
+        return
+
+    rates = fetch_bcv_rates()
+    if not rates or "USD" not in rates:
+        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
+        return
+
+    resultado = cantidad * rates["USD"]
+
+    resultado_str = f"{resultado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    # Formatear cantidad: si es entero mostrar sin decimales
+    if cantidad == int(cantidad):
+        cant_str = str(int(cantidad))
+    else:
+        cant_str = str(cantidad)
+
+    msg = f"{cant_str}$ en bolívares serían: Bs. {resultado_str}"
+    await update.message.reply_text(msg)
+
+
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bcv", bcv))
+    app.add_handler(CommandHandler("calcular", calcular))
+
+    logger.info("Bot iniciado...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
