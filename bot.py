@@ -1,5 +1,6 @@
 import os
 import requests
+import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -11,7 +12,7 @@ app = Flask(__name__)
 # Configuración de la aplicación
 application = Application.builder().token(TOKEN).build()
 
-# Función para obtener tasas desde la API
+# Función para obtener tasas
 def obtener_tasas():
     try:
         res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
@@ -33,10 +34,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasas = obtener_tasas()
     if not tasas:
-        await update.message.reply_text("Error al conectar con el BCV.")
+        await update.message.reply_text("Error al obtener las tasas.")
         return
     
-    # Formato solicitado
     mensaje = (f"TASAS DEL DÍA\n\n"
                f"🇪🇺 Euro: {tasas['euro']} Bs.\n"
                f"🇺🇸 Dolar: {tasas['dolar']} Bs.")
@@ -52,7 +52,6 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tasas = obtener_tasas()
         tasa_dolar = float(str(tasas['dolar']).replace(',', '.'))
         total = cantidad * tasa_dolar
-        # Formato solicitado
         await update.message.reply_text(f"{cantidad}$ en bolívares serían: Bs. {total:,.2f}")
     except:
         await update.message.reply_text("Error: Asegúrate de ingresar un número válido.")
@@ -62,18 +61,24 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# --- WEBHOOK ---
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    # Recibe el mensaje de Telegram
-    update = Update.de_json(request.get_json(force=True), bot)
-    # Lo pone en la cola para que el bot lo procese
-    application.update_queue.put(update)
-    return "OK", 200
+# --- INICIALIZACIÓN ---
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.run_until_complete(application.initialize())
 
+# --- RUTAS WEB ---
 @app.route('/')
 def index():
     return "Bot activo", 200
 
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    json_data = request.get_json(force=True)
+    update = Update.de_json(json_data, bot)
+    loop.run_until_complete(application.process_update(update))
+    return "OK", 200
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Usar el puerto que asigna Render
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
