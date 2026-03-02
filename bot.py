@@ -26,21 +26,38 @@ def fetch_rates():
             return _cache["rates"]
 
     try:
-        response = requests.get("https://ve.dolarapi.com/v1/dolares", timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        # Endpoint directo para dólares
+        r_usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=10)
+        r_eur = requests.get("https://ve.dolarapi.com/v1/euros/oficial", timeout=10)
 
         rates = {}
-        for item in data:
-            fuente = item.get("fuente", "").lower()
-            nombre = item.get("nombre", "").lower()
-            promedio = item.get("promedio")
 
-            if fuente == "bcv" and promedio:
-                if "dólar" in nombre or "dollar" in nombre or "usd" in nombre:
-                    rates["USD"] = float(promedio)
-                elif "euro" in nombre or "eur" in nombre:
-                    rates["EUR"] = float(promedio)
+        if r_usd.status_code == 200:
+            d = r_usd.json()
+            promedio = d.get("promedio")
+            if promedio:
+                rates["USD"] = float(promedio)
+
+        if r_eur.status_code == 200:
+            d = r_eur.json()
+            promedio = d.get("promedio")
+            if promedio:
+                rates["EUR"] = float(promedio)
+
+        # Si no funcionó, usar endpoint general
+        if not rates:
+            response = requests.get("https://ve.dolarapi.com/v1/dolares", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            for item in data:
+                fuente = item.get("fuente", "").lower()
+                nombre = item.get("nombre", "").lower()
+                promedio = item.get("promedio")
+                if fuente in ("bcv", "oficial") and promedio:
+                    if "euro" in nombre or "eur" in nombre:
+                        rates["EUR"] = float(promedio)
+                    else:
+                        rates["USD"] = float(promedio)
 
         if rates:
             _cache["rates"] = rates
@@ -48,7 +65,6 @@ def fetch_rates():
             logger.info(f"Tasas actualizadas: {rates}")
             return rates
         else:
-            logger.warning(f"Respuesta de la API: {data}")
             return _cache["rates"]
 
     except Exception as e:
