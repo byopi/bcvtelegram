@@ -1,32 +1,40 @@
 import os
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Zona horaria Venezuela UTC-4
+VE_TZ = timezone(timedelta(hours=-4))
+
 # Cache para las tasas
 _cache = {
     "rates": None,
-    "timestamp": None
+    "date": None  # fecha VE del día en que se cacheó
 }
 
-CACHE_SECONDS = 300  # 5 minutos
+
+def get_ve_now():
+    return datetime.now(VE_TZ)
 
 
 def fetch_rates():
-    """Obtiene las tasas BCV desde DolarApi.com"""
-    now = datetime.now()
-    if _cache["rates"] and _cache["timestamp"]:
-        diff = (now - _cache["timestamp"]).total_seconds()
-        if diff < CACHE_SECONDS:
-            return _cache["rates"]
+    """
+    Obtiene las tasas BCV desde DolarApi.com.
+    Mantiene la tasa cacheada hasta las 00:00 hora Venezuela del día siguiente.
+    """
+    now_ve = get_ve_now()
+    today_ve = now_ve.date()
+
+    # Si tenemos caché del mismo día, devolver sin actualizar
+    if _cache["rates"] and _cache["date"] == today_ve:
+        return _cache["rates"]
 
     try:
-        # Endpoint directo para dólares
         r_usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=10)
         r_eur = requests.get("https://ve.dolarapi.com/v1/euros/oficial", timeout=10)
 
@@ -44,7 +52,7 @@ def fetch_rates():
             if promedio:
                 rates["EUR"] = float(promedio)
 
-        # Si no funcionó, usar endpoint general
+        # Fallback al endpoint general
         if not rates:
             response = requests.get("https://ve.dolarapi.com/v1/dolares", timeout=10)
             response.raise_for_status()
@@ -61,8 +69,8 @@ def fetch_rates():
 
         if rates:
             _cache["rates"] = rates
-            _cache["timestamp"] = now
-            logger.info(f"Tasas actualizadas: {rates}")
+            _cache["date"] = today_ve
+            logger.info(f"Tasas actualizadas para {today_ve}: {rates}")
             return rates
         else:
             return _cache["rates"]
@@ -73,7 +81,7 @@ def fetch_rates():
 
 
 def format_number(value):
-    """Formatea número con punto de miles y coma decimal (formato venezolano)"""
+    """Formato venezolano: punto de miles, coma decimal"""
     formatted = f"{value:,.2f}"
     return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -81,14 +89,15 @@ def format_number(value):
 def get_date_str():
     meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
              "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-    now = datetime.now()
+    now = get_ve_now()
     return f"{now.day} de {meses[now.month - 1]} de {now.year}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través del comando /bcv, "
-        "y calcular cuánto es en bolívares cierta cantidad de dólares a través de /calcular"
+        "calcular cuánto es en bolívares cierta cantidad de dólares o euros con /calcular, "
+        "y convertir bolívares a dólares o euros con /convertir"
     )
 
 
@@ -117,9 +126,9 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Por favor indica la cantidad y moneda.\n"
+            "Indica la cantidad y moneda.\n"
             "Ejemplos:\n"
-            "/calcular 20 — dólares\n"
+            "/calcular 20 — dólares (por defecto)\n"
             "/calcular 20 eur — euros"
         )
         return
@@ -127,18 +136,14 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cantidad = float(args[0].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("❌ El valor ingresado no es válido. Ejemplo: /calcular 20")
+        await update.message.reply_text("❌ Valor no válido. Ejemplo: /calcular 20")
         return
 
-    # Detectar moneda (segundo argumento opcional, default USD)
     moneda = args[1].lower() if len(args) > 1 else "usd"
 
     if moneda in ("eur", "euro", "euros", "€"):
         clave = "EUR"
         simbolo = "€"
-    elif moneda in ("usd", "dolar", "dólar", "dolares", "dólares", "$"):
-        clave = "USD"
-        simbolo = "$"
     else:
         clave = "USD"
         simbolo = "$"
@@ -160,17 +165,17 @@ async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Por favor indica la cantidad en bolívares y la moneda.\n"
+            "Indica la cantidad en bolívares y la moneda destino.\n"
             "Ejemplos:\n"
-            "/convertir 100 — convierte Bs a dólares\n"
-            "/convertir 100 eur — convierte Bs a euros"
+            "/convertir 10000 — convierte Bs. a dólares (por defecto)\n"
+            "/convertir 10000 eur — convierte Bs. a euros"
         )
         return
 
     try:
         cantidad = float(args[0].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("❌ El valor ingresado no es válido. Ejemplo: /convertir 100")
+        await update.message.reply_text("❌ Valor no válido. Ejemplo: /convertir 10000")
         return
 
     moneda = args[1].lower() if len(args) > 1 else "usd"
@@ -178,9 +183,11 @@ async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if moneda in ("eur", "euro", "euros", "€"):
         clave = "EUR"
         simbolo = "€"
+        nombre = "euros"
     else:
         clave = "USD"
         simbolo = "$"
+        nombre = "dólares"
 
     rates = fetch_rates()
     if not rates or clave not in rates:
@@ -188,14 +195,14 @@ async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     resultado = cantidad / rates[clave]
-    resultado_str = f"{resultado:,.2f}"
+    resultado_str = format_number(resultado)
     cant_str = format_number(cantidad)
 
-    msg = f"Bs. {cant_str} en {simbolo} serían: {simbolo}{resultado_str}"
+    msg = f"Bs. {cant_str} en {nombre} serían: {simbolo}{resultado_str}"
     await update.message.reply_text(msg)
 
 
-
+def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
