@@ -2,17 +2,17 @@ import os
 import requests
 import asyncio
 from flask import Flask, request
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-bot = Bot(token=TOKEN)
 app = Flask(__name__)
 
-# --- Inicialización global para Gunicorn ---
+# --- INICIALIZACIÓN ---
+# Construimos la app y usamos el método build para obtener el objeto Bot correctamente
 application = Application.builder().token(TOKEN).build()
 
-# Definición de funciones y Handlers
+# Definimos funciones después de tener la aplicación
 def obtener_tasas():
     try:
         res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
@@ -30,7 +30,7 @@ async def start(update, context):
 async def bcv(update, context):
     tasas = obtener_tasas()
     if tasas:
-        await update.message.reply_text(f"TASAS DEL DÍA\n\n🇪🇺 Euro: {tasas['euro']} Bs.\n🇺🇸 Dolar: {tasas['dolar']} Bs.")
+        await update.message.reply_text(f"TASAS DEL DÍA\n\n🇪🇺 Euro: {tasas['euro']} Bs.\n🇺🇸 Dolar: {tasas['dolar']} Bs.\n")
 
 async def calcular(update, context):
     try:
@@ -45,7 +45,8 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# --- INICIALIZACIÓN FORZADA ---
+# --- INICIALIZACIÓN ASÍNCRONA ---
+# Esto es necesario para que el bot conozca su propio nombre de usuario
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 loop.run_until_complete(application.initialize())
@@ -56,7 +57,9 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Procesamos directamente sin reiniciar el loop
-    update = Update.de_json(request.get_json(force=True), bot)
+    # Convertimos el JSON recibido en un objeto Update
+    # Usamos application.bot directamente
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    # Procesamos la actualización usando el loop global
     loop.run_until_complete(application.process_update(update))
     return "OK", 200
