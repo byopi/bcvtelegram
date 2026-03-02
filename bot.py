@@ -116,7 +116,12 @@ async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("Por favor indica la cantidad. Ejemplo: /calcular 20")
+        await update.message.reply_text(
+            "Por favor indica la cantidad y moneda.\n"
+            "Ejemplos:\n"
+            "/calcular 20 — dólares\n"
+            "/calcular 20 eur — euros"
+        )
         return
 
     try:
@@ -125,20 +130,72 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ El valor ingresado no es válido. Ejemplo: /calcular 20")
         return
 
+    # Detectar moneda (segundo argumento opcional, default USD)
+    moneda = args[1].lower() if len(args) > 1 else "usd"
+
+    if moneda in ("eur", "euro", "euros", "€"):
+        clave = "EUR"
+        simbolo = "€"
+    elif moneda in ("usd", "dolar", "dólar", "dolares", "dólares", "$"):
+        clave = "USD"
+        simbolo = "$"
+    else:
+        clave = "USD"
+        simbolo = "$"
+
     rates = fetch_rates()
-    if not rates or "USD" not in rates:
+    if not rates or clave not in rates:
         await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
         return
 
-    resultado = cantidad * rates["USD"]
+    resultado = cantidad * rates[clave]
     resultado_str = format_number(resultado)
     cant_str = str(int(cantidad)) if cantidad == int(cantidad) else str(cantidad)
 
-    msg = f"{cant_str}$ en bolívares serían: Bs. {resultado_str}"
+    msg = f"{cant_str}{simbolo} en bolívares serían: Bs. {resultado_str}"
     await update.message.reply_text(msg)
 
 
-def main():
+async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Por favor indica la cantidad en bolívares y la moneda.\n"
+            "Ejemplos:\n"
+            "/convertir 100 — convierte Bs a dólares\n"
+            "/convertir 100 eur — convierte Bs a euros"
+        )
+        return
+
+    try:
+        cantidad = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ El valor ingresado no es válido. Ejemplo: /convertir 100")
+        return
+
+    moneda = args[1].lower() if len(args) > 1 else "usd"
+
+    if moneda in ("eur", "euro", "euros", "€"):
+        clave = "EUR"
+        simbolo = "€"
+    else:
+        clave = "USD"
+        simbolo = "$"
+
+    rates = fetch_rates()
+    if not rates or clave not in rates:
+        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
+        return
+
+    resultado = cantidad / rates[clave]
+    resultado_str = f"{resultado:,.2f}"
+    cant_str = format_number(cantidad)
+
+    msg = f"Bs. {cant_str} en {simbolo} serían: {simbolo}{resultado_str}"
+    await update.message.reply_text(msg)
+
+
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
@@ -148,6 +205,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("bcv", bcv))
     app.add_handler(CommandHandler("calcular", calcular))
+    app.add_handler(CommandHandler("convertir", convertir))
 
     logger.info("Bot iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
