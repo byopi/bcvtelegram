@@ -1,15 +1,18 @@
 import os
 import requests
+import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
+bot = Bot(token=TOKEN)
 app = Flask(__name__)
 
-# --- INICIALIZACIÓN FUERA DE LAS RUTAS ---
+# --- Inicialización global para Gunicorn ---
 application = Application.builder().token(TOKEN).build()
 
+# Definición de funciones y Handlers
 def obtener_tasas():
     try:
         res_dolar = requests.get("https://pydolarve.org/api/v1/dollar?monitor=bcv").json()
@@ -42,12 +45,10 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("bcv", bcv))
 application.add_handler(CommandHandler("calcular", calcular))
 
-# --- INICIALIZACIÓN CRÍTICA PARA GUNICORN ---
-import asyncio
+# --- INICIALIZACIÓN FORZADA ---
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 loop.run_until_complete(application.initialize())
-loop.run_until_complete(application.start())
 
 @app.route('/')
 def index():
@@ -55,6 +56,7 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    # Procesamos directamente sin reiniciar el loop
+    update = Update.de_json(request.get_json(force=True), bot)
     loop.run_until_complete(application.process_update(update))
     return "OK", 200
