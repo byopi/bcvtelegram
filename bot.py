@@ -1,9 +1,11 @@
 import os
 import logging
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -11,26 +13,67 @@ logger = logging.getLogger(__name__)
 # Zona horaria Venezuela UTC-4
 VE_TZ = timezone(timedelta(hours=-4))
 
+CANAL = "@botsgfa"
+CANAL_URL = "https://t.me/botsgfa"
+
 # Cache para las tasas
 _cache = {
     "rates": None,
-    "date": None  # fecha VE del día en que se cacheó
+    "date": None
 }
 
+
+# ── Servidor HTTP para UptimeRobot ──────────────────────────────────────────
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # silenciar logs del servidor HTTP
+
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), PingHandler)
+    logger.info(f"Servidor HTTP corriendo en puerto {port}")
+    server.serve_forever()
+
+
+# ── Utilidades ───────────────────────────────────────────────────────────────
 
 def get_ve_now():
     return datetime.now(VE_TZ)
 
 
+async def check_suscripcion(user_id: int, context) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CANAL, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning(f"No se pudo verificar suscripción: {e}")
+        return False
+
+
+async def pedir_suscripcion(update: Update):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
+        [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
+    ])
+    await update.message.reply_text(
+        "⚠️ Para usar este bot necesitas estar suscrito a nuestro canal.\n\n"
+        "Una vez suscrito, presiona el botón *'Ya me suscribí'* para continuar.",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
 def fetch_rates():
-    """
-    Obtiene las tasas BCV desde DolarApi.com.
-    Mantiene la tasa cacheada hasta las 00:00 hora Venezuela del día siguiente.
-    """
     now_ve = get_ve_now()
     today_ve = now_ve.date()
 
-    # Si tenemos caché del mismo día, devolver sin actualizar
     if _cache["rates"] and _cache["date"] == today_ve:
         return _cache["rates"]
 
@@ -52,7 +95,6 @@ def fetch_rates():
             if promedio:
                 rates["EUR"] = float(promedio)
 
-        # Fallback al endpoint general
         if not rates:
             response = requests.get("https://ve.dolarapi.com/v1/dolares", timeout=10)
             response.raise_for_status()
@@ -81,7 +123,6 @@ def fetch_rates():
 
 
 def format_number(value):
-    """Formato venezolano: punto de miles, coma decimal"""
     formatted = f"{value:,.2f}"
     return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -93,7 +134,19 @@ def get_date_str():
     return f"{now.day} de {meses[now.month - 1]} de {now.year}"
 
 
+def es_privado(update: Update) -> bool:
+    return update.message.chat.type == "private"
+
+
+# ── Comandos ─────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if es_privado(update):
+        suscrito = await check_suscripcion(update.effective_user.id, context)
+        if not suscrito:
+            await pedir_suscripcion(update)
+            return
+
     await update.message.reply_text(
         "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través del comando /bcv, "
         "calcular cuánto es en bolívares cierta cantidad de dólares o euros con /calcular, "
@@ -102,6 +155,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if es_privado(update):
+        suscrito = await check_suscripcion(update.effective_user.id, context)
+        if not suscrito:
+            await pedir_suscripcion(update)
+            return
+
     rates = fetch_rates()
     if not rates:
         await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
@@ -123,6 +182,12 @@ async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if es_privado(update):
+        suscrito = await check_suscripcion(update.effective_user.id, context)
+        if not suscrito:
+            await pedir_suscripcion(update)
+            return
+
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -162,6 +227,12 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if es_privado(update):
+        suscrito = await check_suscripcion(update.effective_user.id, context)
+        if not suscrito:
+            await pedir_suscripcion(update)
+            return
+
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -202,10 +273,40 @@ async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    suscrito = await check_suscripcion(query.from_user.id, context)
+    if suscrito:
+        await query.edit_message_text(
+            "✅ ¡Suscripción verificada! Ya puedes usar todos los comandos:\n\n"
+            "/bcv — Ver tasa del día\n"
+            "/calcular 20 — Calcular USD a Bs.\n"
+            "/calcular 20 eur — Calcular EUR a Bs.\n"
+            "/convertir 10000 — Convertir Bs. a USD"
+        )
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
+            [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
+        ])
+        await query.edit_message_text(
+            "❌ Aún no estás suscrito al canal. Suscríbete y vuelve a intentarlo.",
+            reply_markup=keyboard
+        )
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
+
+    # Iniciar servidor HTTP en hilo separado para UptimeRobot
+    t = threading.Thread(target=run_http_server, daemon=True)
+    t.start()
 
     app = Application.builder().token(token).build()
 
@@ -213,6 +314,7 @@ def main():
     app.add_handler(CommandHandler("bcv", bcv))
     app.add_handler(CommandHandler("calcular", calcular))
     app.add_handler(CommandHandler("convertir", convertir))
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
 
     logger.info("Bot iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
