@@ -1,52 +1,124 @@
 import os
 import logging
-import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import (Application, CommandHandler, ContextTypes,
+                           CallbackQueryHandler, MessageHandler, filters,
+                           ConversationHandler)
+from pyDolarVenezuela.pages import BCV, ExchangeMonitor
+from pyDolarVenezuela import Monitor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Zona horaria Venezuela UTC-4
 VE_TZ = timezone(timedelta(hours=-4))
 
-CANAL = "@botsgfa"
+CANAL     = "@botsgfa"
 CANAL_URL = "https://t.me/botsgfa"
 
-# Cache para las tasas
+# Estados para ConversationHandler del panel admin
+(
+    ADMIN_MENU,
+    ESPERANDO_MSG_GLOBAL,
+    ESPERANDO_USUARIO,
+    ESPERANDO_MSG_USUARIO,
+) = range(4)
+
+# Cache
 _cache = {
-    "rates": None,
-    "date": None
+    "bcv":     {"rates": None, "date": None},
+    "binance": {"rate":  None, "date": None},
 }
 
 
-# ── Servidor HTTP para UptimeRobot ──────────────────────────────────────────
+# ── Servidor HTTP para UptimeRobot ───────────────────────────────────────────
 
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-
     def log_message(self, format, *args):
-        pass  # silenciar logs del servidor HTTP
-
+        pass
 
 def run_http_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), PingHandler)
-    logger.info(f"Servidor HTTP corriendo en puerto {port}")
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
 
 
-# ── Utilidades ───────────────────────────────────────────────────────────────
+# ── Utilidades generales ─────────────────────────────────────────────────────
+
+def get_admin_id() -> int | None:
+    val = os.environ.get("ADMIN_ID")
+    return int(val) if val else None
 
 def get_ve_now():
     return datetime.now(VE_TZ)
 
+def es_admin(user_id: int) -> bool:
+    admin_id = get_admin_id()
+    return admin_id is not None and user_id == admin_id
+
+def es_privado(update: Update) -> bool:
+    return update.message.chat.type == "private"
+
+def format_number(value):
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def get_date_str():
+    meses = ["enero","febrero","marzo","abril","mayo","junio",
+             "julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    now = get_ve_now()
+    return f"{now.day} de {meses[now.month - 1]} de {now.year}"
+
+
+# ── Tasas ────────────────────────────────────────────────────────────────────
+
+def fetch_bcv_rates():
+    today_ve = get_ve_now().date()
+    c = _cache["bcv"]
+    if c["rates"] and c["date"] == today_ve:
+        return c["rates"]
+    try:
+        usd_data = Monitor(BCV, 'USD').get_value_monitors("usd")
+        eur_data = Monitor(BCV, 'EUR').get_value_monitors("eur")
+        rates = {}
+        if usd_data and usd_data.price:
+            rates["USD"] = float(usd_data.price)
+        if eur_data and eur_data.price:
+            rates["EUR"] = float(eur_data.price)
+        if rates:
+            c["rates"] = rates
+            c["date"]  = today_ve
+            logger.info(f"BCV actualizado {today_ve}: {rates}")
+        return rates or c["rates"]
+    except Exception as e:
+        logger.error(f"Error BCV: {e}")
+        return c["rates"]
+
+def fetch_binance_rate():
+    today_ve = get_ve_now().date()
+    c = _cache["binance"]
+    if c["rate"] and c["date"] == today_ve:
+        return c["rate"]
+    try:
+        data = Monitor(ExchangeMonitor, 'USD').get_value_monitors("binance")
+        if data and data.price:
+            price = float(data.price)
+            c["rate"] = price
+            c["date"] = today_ve
+            logger.info(f"Binance/USDT actualizado {today_ve}: {price}")
+            return price
+        logger.warning("No se obtuvo tasa Binance de ExchangeMonitor")
+        return c["rate"]
+    except Exception as e:
+        logger.error(f"Error Binance: {e}")
+        return c["rate"]
+
+
+# ── Suscripción ──────────────────────────────────────────────────────────────
 
 async def check_suscripcion(user_id: int, context) -> bool:
     try:
@@ -55,7 +127,6 @@ async def check_suscripcion(user_id: int, context) -> bool:
     except Exception as e:
         logger.warning(f"No se pudo verificar suscripción: {e}")
         return False
-
 
 async def pedir_suscripcion(update: Update):
     keyboard = InlineKeyboardMarkup([
@@ -70,221 +141,128 @@ async def pedir_suscripcion(update: Update):
     )
 
 
-def fetch_rates():
-    now_ve = get_ve_now()
-    today_ve = now_ve.date()
-
-    if _cache["rates"] and _cache["date"] == today_ve:
-        return _cache["rates"]
-
-    try:
-        r_usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=10)
-        r_eur = requests.get("https://ve.dolarapi.com/v1/euros/oficial", timeout=10)
-
-        rates = {}
-
-        if r_usd.status_code == 200:
-            d = r_usd.json()
-            promedio = d.get("promedio")
-            if promedio:
-                rates["USD"] = float(promedio)
-
-        if r_eur.status_code == 200:
-            d = r_eur.json()
-            promedio = d.get("promedio")
-            if promedio:
-                rates["EUR"] = float(promedio)
-
-        if not rates:
-            response = requests.get("https://ve.dolarapi.com/v1/dolares", timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            for item in data:
-                fuente = item.get("fuente", "").lower()
-                nombre = item.get("nombre", "").lower()
-                promedio = item.get("promedio")
-                if fuente in ("bcv", "oficial") and promedio:
-                    if "euro" in nombre or "eur" in nombre:
-                        rates["EUR"] = float(promedio)
-                    else:
-                        rates["USD"] = float(promedio)
-
-        if rates:
-            _cache["rates"] = rates
-            _cache["date"] = today_ve
-            logger.info(f"Tasas actualizadas para {today_ve}: {rates}")
-            return rates
-        else:
-            return _cache["rates"]
-
-    except Exception as e:
-        logger.error(f"Error fetching rates: {e}")
-        return _cache["rates"]
-
-
-def format_number(value):
-    formatted = f"{value:,.2f}"
-    return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def get_date_str():
-    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-    now = get_ve_now()
-    return f"{now.day} de {meses[now.month - 1]} de {now.year}"
-
-
-def es_privado(update: Update) -> bool:
-    return update.message.chat.type == "private"
-
-
-# ── Comandos ─────────────────────────────────────────────────────────────────
+# ── Comandos públicos ────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_privado(update):
-        suscrito = await check_suscripcion(update.effective_user.id, context)
-        if not suscrito:
+        if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
             return
-
     await update.message.reply_text(
         "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través del comando /bcv, "
         "calcular cuánto es en bolívares cierta cantidad de dólares o euros con /calcular, "
         "y convertir bolívares a dólares o euros con /convertir"
     )
 
-
 async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_privado(update):
-        suscrito = await check_suscripcion(update.effective_user.id, context)
-        if not suscrito:
+        if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
             return
-
-    rates = fetch_rates()
+    rates   = fetch_bcv_rates()
+    binance = fetch_binance_rate()
     if not rates:
         await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
         return
-
-    usd = rates.get("USD")
-    eur = rates.get("EUR")
-
-    usd_str = format_number(usd) if usd else "No disponible"
-    eur_str = format_number(eur) if eur else "No disponible"
-
+    usd_str     = format_number(rates["USD"]) if rates.get("USD") else "No disponible"
+    eur_str     = format_number(rates["EUR"]) if rates.get("EUR") else "No disponible"
+    binance_str = format_number(binance)      if binance           else "No disponible"
     msg = (
         f"*TASAS DEL DÍA*\n"
         f"📅 {get_date_str()}\n\n"
         f"🇪🇺 Euro: Bs. {eur_str}\n"
-        f"🇺🇸 Dólar: Bs. {usd_str}"
+        f"🇺🇸 Dólar: Bs. {usd_str}\n"
+        f"💲 Binance / USDT: Bs. {binance_str}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-
 async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_privado(update):
-        suscrito = await check_suscripcion(update.effective_user.id, context)
-        if not suscrito:
+        if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
             return
-
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Indica la cantidad y moneda.\n"
-            "Ejemplos:\n"
-            "/calcular 20 — dólares (por defecto)\n"
-            "/calcular 20 eur — euros"
+            "Indica la cantidad y moneda.\nEjemplos:\n"
+            "/calcular 20 — dólares BCV (por defecto)\n"
+            "/calcular 20 eur — euros BCV\n"
+            "/calcular 20 usdt — Binance/USDT"
         )
         return
-
     try:
         cantidad = float(args[0].replace(",", "."))
     except ValueError:
         await update.message.reply_text("❌ Valor no válido. Ejemplo: /calcular 20")
         return
-
     moneda = args[1].lower() if len(args) > 1 else "usd"
-
     if moneda in ("eur", "euro", "euros", "€"):
-        clave = "EUR"
-        simbolo = "€"
+        rates = fetch_bcv_rates()
+        tasa = rates.get("EUR") if rates else None
+        simbolo = "€"; fuente = "BCV"
+    elif moneda in ("usdt", "binance", "crypto"):
+        tasa = fetch_binance_rate()
+        simbolo = "USDT"; fuente = "Binance"
     else:
-        clave = "USD"
-        simbolo = "$"
-
-    rates = fetch_rates()
-    if not rates or clave not in rates:
-        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
+        rates = fetch_bcv_rates()
+        tasa = rates.get("USD") if rates else None
+        simbolo = "$"; fuente = "BCV"
+    if not tasa:
+        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
         return
-
-    resultado = cantidad * rates[clave]
-    resultado_str = format_number(resultado)
     cant_str = str(int(cantidad)) if cantidad == int(cantidad) else str(cantidad)
-
-    msg = f"{cant_str}{simbolo} en bolívares serían: Bs. {resultado_str}"
+    msg = f"{cant_str} {simbolo} ({fuente}) en bolívares serían: Bs. {format_number(cantidad * tasa)}"
     await update.message.reply_text(msg)
-
 
 async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_privado(update):
-        suscrito = await check_suscripcion(update.effective_user.id, context)
-        if not suscrito:
+        if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
             return
-
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Indica la cantidad en bolívares y la moneda destino.\n"
-            "Ejemplos:\n"
-            "/convertir 10000 — convierte Bs. a dólares (por defecto)\n"
-            "/convertir 10000 eur — convierte Bs. a euros"
+            "Indica la cantidad en bolívares y la moneda destino.\nEjemplos:\n"
+            "/convertir 10000 — Bs. a dólares BCV (por defecto)\n"
+            "/convertir 10000 eur — Bs. a euros BCV\n"
+            "/convertir 10000 usdt — Bs. a Binance/USDT"
         )
         return
-
     try:
         cantidad = float(args[0].replace(",", "."))
     except ValueError:
         await update.message.reply_text("❌ Valor no válido. Ejemplo: /convertir 10000")
         return
-
     moneda = args[1].lower() if len(args) > 1 else "usd"
-
     if moneda in ("eur", "euro", "euros", "€"):
-        clave = "EUR"
-        simbolo = "€"
-        nombre = "euros"
+        rates = fetch_bcv_rates()
+        tasa = rates.get("EUR") if rates else None
+        simbolo = "€"; nombre = "euros (BCV)"
+    elif moneda in ("usdt", "binance", "crypto"):
+        tasa = fetch_binance_rate()
+        simbolo = "USDT"; nombre = "Binance / USDT"
     else:
-        clave = "USD"
-        simbolo = "$"
-        nombre = "dólares"
-
-    rates = fetch_rates()
-    if not rates or clave not in rates:
-        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
+        rates = fetch_bcv_rates()
+        tasa = rates.get("USD") if rates else None
+        simbolo = "$"; nombre = "dólares (BCV)"
+    if not tasa:
+        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
         return
-
-    resultado = cantidad / rates[clave]
-    resultado_str = format_number(resultado)
-    cant_str = format_number(cantidad)
-
-    msg = f"Bs. {cant_str} en {nombre} serían: {simbolo}{resultado_str}"
+    msg = f"Bs. {format_number(cantidad)} en {nombre} serían: {simbolo}{format_number(cantidad / tasa)}"
     await update.message.reply_text(msg)
-
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    suscrito = await check_suscripcion(query.from_user.id, context)
-    if suscrito:
+    if await check_suscripcion(query.from_user.id, context):
         await query.edit_message_text(
             "✅ ¡Suscripción verificada! Ya puedes usar todos los comandos:\n\n"
-            "/bcv — Ver tasa del día\n"
-            "/calcular 20 — Calcular USD a Bs.\n"
-            "/calcular 20 eur — Calcular EUR a Bs.\n"
-            "/convertir 10000 — Convertir Bs. a USD"
+            "/bcv — Ver tasas del día\n"
+            "/calcular 20 — USD a Bs.\n"
+            "/calcular 20 eur — EUR a Bs.\n"
+            "/calcular 20 usdt — Binance/USDT a Bs.\n"
+            "/convertir 10000 — Bs. a USD\n"
+            "/convertir 10000 usdt — Bs. a USDT"
         )
     else:
         keyboard = InlineKeyboardMarkup([
@@ -297,6 +275,137 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+# ── Panel de Administrador (/gfa) ────────────────────────────────────────────
+
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Mensaje global",        callback_data="admin_global")],
+        [InlineKeyboardButton("✉️ Mensaje a usuario",     callback_data="admin_usuario")],
+        [InlineKeyboardButton("❌ Cerrar panel",          callback_data="admin_cerrar")],
+    ])
+
+async def gfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return  # ignorar silenciosamente si no es admin
+    await update.message.reply_text(
+        "🔐 *Panel de Administrador*\n\n¿Qué deseas hacer?",
+        parse_mode="Markdown",
+        reply_markup=admin_menu_keyboard()
+    )
+    return ADMIN_MENU
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not es_admin(query.from_user.id):
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "admin_global":
+        await query.edit_message_text(
+            "📣 *Mensaje global*\n\nEscribe el mensaje que quieres enviar a todos los usuarios "
+            "que han interactuado con el bot.\n\n_Escribe /cancelar para salir._",
+            parse_mode="Markdown"
+        )
+        return ESPERANDO_MSG_GLOBAL
+
+    elif data == "admin_usuario":
+        await query.edit_message_text(
+            "✉️ *Mensaje a usuario*\n\nEnvíame el *ID numérico* o *@username* del destinatario.\n\n"
+            "_Escribe /cancelar para salir._",
+            parse_mode="Markdown"
+        )
+        return ESPERANDO_USUARIO
+
+    elif data == "admin_cerrar":
+        await query.edit_message_text("✅ Panel cerrado.")
+        return ConversationHandler.END
+
+async def recibir_msg_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    texto = update.message.text
+    if texto == "/cancelar":
+        await update.message.reply_text("❌ Operación cancelada.")
+        return ConversationHandler.END
+
+    usuarios = context.bot_data.get("usuarios", set())
+    if not usuarios:
+        await update.message.reply_text("⚠️ No hay usuarios registrados aún.")
+        return ConversationHandler.END
+
+    enviados = 0
+    fallidos = 0
+    for uid in usuarios:
+        try:
+            await context.bot.send_message(chat_id=uid, text=texto)
+            enviados += 1
+        except Exception:
+            fallidos += 1
+
+    await update.message.reply_text(
+        f"✅ Mensaje global enviado.\n📤 Enviados: {enviados}\n❌ Fallidos: {fallidos}"
+    )
+    return ConversationHandler.END
+
+async def recibir_usuario_destino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    texto = update.message.text
+    if texto == "/cancelar":
+        await update.message.reply_text("❌ Operación cancelada.")
+        return ConversationHandler.END
+
+    # Guardar destinatario en context.user_data
+    context.user_data["admin_destino"] = texto.strip()
+    await update.message.reply_text(
+        f"✉️ Destinatario: `{texto.strip()}`\n\nAhora escribe el mensaje a enviar.\n\n"
+        "_Escribe /cancelar para salir._",
+        parse_mode="Markdown"
+    )
+    return ESPERANDO_MSG_USUARIO
+
+async def recibir_msg_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    texto = update.message.text
+    if texto == "/cancelar":
+        await update.message.reply_text("❌ Operación cancelada.")
+        return ConversationHandler.END
+
+    destino = context.user_data.get("admin_destino")
+    try:
+        # Intentar como int (ID) o string (@username)
+        chat_id = int(destino) if destino.lstrip("-").isdigit() else destino
+        await context.bot.send_message(chat_id=chat_id, text=texto)
+        await update.message.reply_text(f"✅ Mensaje enviado a `{destino}`.", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ No se pudo enviar el mensaje a `{destino}`.\nError: {e}", parse_mode="Markdown")
+
+    context.user_data.pop("admin_destino", None)
+    return ConversationHandler.END
+
+async def cancelar_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Operación cancelada.")
+    return ConversationHandler.END
+
+
+# ── Registro de usuarios ─────────────────────────────────────────────────────
+
+async def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registra cualquier usuario que interactúe en privado para el mensaje global."""
+    if update.effective_chat and update.effective_chat.type == "private":
+        uid = update.effective_user.id
+        if "usuarios" not in context.bot_data:
+            context.bot_data["usuarios"] = set()
+        context.bot_data["usuarios"].add(uid)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -304,17 +413,43 @@ def main():
     if not token:
         raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
 
-    # Iniciar servidor HTTP en hilo separado para UptimeRobot
-    t = threading.Thread(target=run_http_server, daemon=True)
-    t.start()
+    threading.Thread(target=run_http_server, daemon=True).start()
 
     app = Application.builder().token(token).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bcv", bcv))
-    app.add_handler(CommandHandler("calcular", calcular))
+    # Comandos públicos
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("bcv",       bcv))
+    app.add_handler(CommandHandler("calcular",  calcular))
     app.add_handler(CommandHandler("convertir", convertir))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+
+    # Panel admin con ConversationHandler
+    admin_conv = ConversationHandler(
+        entry_points=[CommandHandler("gfa", gfa)],
+        states={
+            ADMIN_MENU: [
+                CallbackQueryHandler(admin_callback, pattern="^admin_")
+            ],
+            ESPERANDO_MSG_GLOBAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_global),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+            ESPERANDO_USUARIO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_usuario_destino),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+            ESPERANDO_MSG_USUARIO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_usuario),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar_admin)],
+    )
+    app.add_handler(admin_conv)
+
+    # Middleware para registrar usuarios
+    app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
 
     logger.info("Bot iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
