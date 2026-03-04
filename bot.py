@@ -82,21 +82,50 @@ def fetch_bcv_rates():
     if c["rates"] and c["date"] == today_ve:
         return c["rates"]
     try:
-        usd_data = Monitor(BCV, 'USD').get_value_monitors("usd")
-        eur_data = Monitor(BCV, 'EUR').get_value_monitors("eur")
         rates = {}
-        if usd_data and usd_data.price:
-            rates["USD"] = float(usd_data.price)
-        if eur_data and eur_data.price:
-            rates["EUR"] = float(eur_data.price)
+
+        # USD
+        try:
+            all_usd = Monitor(BCV, 'USD').get_all_monitors()
+            if isinstance(all_usd, list):
+                for item in all_usd:
+                    if hasattr(item, 'price') and item.price:
+                        rates["USD"] = float(item.price)
+                        break
+            elif hasattr(all_usd, '__dict__'):
+                for key, val in vars(all_usd).items():
+                    if hasattr(val, 'price') and val.price:
+                        rates["USD"] = float(val.price)
+                        break
+        except Exception as e:
+            logger.error(f"Error BCV USD: {e}")
+
+        # EUR — BCV solo acepta 'EUR' como currency separado
+        try:
+            all_eur = Monitor(BCV, 'EUR').get_all_monitors()
+            if isinstance(all_eur, list):
+                for item in all_eur:
+                    if hasattr(item, 'price') and item.price:
+                        rates["EUR"] = float(item.price)
+                        break
+            elif hasattr(all_eur, '__dict__'):
+                for key, val in vars(all_eur).items():
+                    if hasattr(val, 'price') and val.price:
+                        rates["EUR"] = float(val.price)
+                        break
+        except Exception as e:
+            logger.error(f"Error BCV EUR: {e}")
+
         if rates:
             c["rates"] = rates
             c["date"]  = today_ve
             logger.info(f"BCV actualizado {today_ve}: {rates}")
         return rates or c["rates"]
+
     except Exception as e:
-        logger.error(f"Error BCV: {e}")
+        logger.error(f"Error BCV general: {e}")
         return c["rates"]
+
 
 def fetch_binance_rate():
     today_ve = get_ve_now().date()
@@ -104,15 +133,38 @@ def fetch_binance_rate():
     if c["rate"] and c["date"] == today_ve:
         return c["rate"]
     try:
-        data = Monitor(ExchangeMonitor, 'USD').get_value_monitors("binance")
-        if data and data.price:
-            price = float(data.price)
+        monitor = Monitor(ExchangeMonitor, 'USD')
+        all_monitors = monitor.get_all_monitors()
+        price = None
+
+        if isinstance(all_monitors, list):
+            # Primero buscar por nombre "binance"
+            for item in all_monitors:
+                title = str(getattr(item, 'title', '') or getattr(item, 'key', '') or getattr(item, 'name', '')).lower()
+                if "binance" in title and hasattr(item, 'price') and item.price:
+                    price = float(item.price)
+                    break
+            # Si no, tomar el primero disponible
+            if price is None:
+                for item in all_monitors:
+                    if hasattr(item, 'price') and item.price:
+                        price = float(item.price)
+                        break
+        elif hasattr(all_monitors, '__dict__'):
+            for key, val in vars(all_monitors).items():
+                if "binance" in key.lower() and hasattr(val, 'price') and val.price:
+                    price = float(val.price)
+                    break
+
+        if price:
             c["rate"] = price
             c["date"] = today_ve
             logger.info(f"Binance/USDT actualizado {today_ve}: {price}")
             return price
-        logger.warning("No se obtuvo tasa Binance de ExchangeMonitor")
+
+        logger.warning("No se encontró tasa Binance en ExchangeMonitor")
         return c["rate"]
+
     except Exception as e:
         logger.error(f"Error Binance: {e}")
         return c["rate"]
