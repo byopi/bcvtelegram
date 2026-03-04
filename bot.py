@@ -7,7 +7,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, ContextTypes,
                            CallbackQueryHandler, MessageHandler, filters,
                            ConversationHandler)
-from pyDolarVenezuela.pages import BCV, ExchangeMonitor, CriptoDolar
+from pyDolarVenezuela.pages import BCV
+import requests
+from bs4 import BeautifulSoup
 from pyDolarVenezuela import Monitor
 
 logging.basicConfig(level=logging.INFO)
@@ -78,8 +80,8 @@ def get_date_str():
 
 def fetch_bcv_rates():
     """
-    USD: Monitor(BCV, 'USD') — única moneda soportada por BCV.
-    EUR: Monitor(ExchangeMonitor, 'EUR') — ExchangeMonitor soporta EUR.
+    USD: Monitor(BCV, 'USD') — oficial BCV
+    EUR: scraping directo bcv.org.ve
     """
     today_ve = get_ve_now().date()
     c = _cache["bcv"]
@@ -94,26 +96,20 @@ def fetch_bcv_rates():
             if usd and usd.price:
                 rates["USD"] = float(usd.price)
         except Exception as e:
-            logger.error(f"Error BCV USD: {e}")
+            logger.error(f"Error USD BCV: {e}")
 
-        # EUR desde ExchangeMonitor (soporta EUR)
+        # EUR scraping directo de bcv.org.ve
         try:
-            eur = Monitor(ExchangeMonitor, 'EUR').get_value_monitors("bcv")
-            if eur and eur.price:
-                rates["EUR"] = float(eur.price)
-        except Exception as e1:
-            # Fallback: tomar cualquier monitor EUR disponible
-            try:
-                all_eur = Monitor(ExchangeMonitor, 'EUR').get_all_monitors()
-                if isinstance(all_eur, list) and all_eur:
-                    rates["EUR"] = float(all_eur[0].price)
-                elif hasattr(all_eur, '__dict__'):
-                    for v in vars(all_eur).values():
-                        if hasattr(v, 'price') and v.price:
-                            rates["EUR"] = float(v.price)
-                            break
-            except Exception as e2:
-                logger.error(f"Error EUR fallback: {e2}")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get("https://www.bcv.org.ve/", headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            euro_div = soup.find("div", {"id": "euro"})
+            if euro_div:
+                strong = euro_div.find("strong")
+                if strong:
+                    rates["EUR"] = float(strong.text.strip().replace(",", "."))
+        except Exception as e:
+            logger.error(f"Error EUR scraping: {e}")
 
         if rates:
             c["rates"] = rates
@@ -127,184 +123,46 @@ def fetch_bcv_rates():
 
 
 def fetch_binance_rate():
-    """Binance/USDT desde CriptoDolar."""
+    """Binance/USDT scrapeado desde exchangemonitor.net"""
     today_ve = get_ve_now().date()
     c = _cache["binance"]
     if c["rate"] and c["date"] == today_ve:
         return c["rate"]
     try:
-        data = Monitor(CriptoDolar, 'USD').get_value_monitors("binance")
-        if data and data.price:
-            price = float(data.price)
-            c["rate"] = price
-            c["date"] = today_ve
-            logger.info(f"Binance/USDT actualizado {today_ve}: {price}")
-            return price
-        logger.warning("No se obtuvo tasa Binance de CriptoDolar")
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get("https://exchangemonitor.net/venezuela/dolar-binance", headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        # El precio aparece en un elemento con clase "price" o similar
+        # Buscar el valor principal de la tasa
+        price_el = soup.find("p", {"class": "specific-value"})
+        if not price_el:
+            price_el = soup.find("div", {"class": "price"})
+        if not price_el:
+            # Buscar en meta tags
+            meta = soup.find("meta", {"property": "og:description"})
+            if meta:
+                import re
+                match = re.search(r"[\d.,]+", meta.get("content", "").replace(".", "").replace(",", "."))
+                if match:
+                    c["rate"] = float(match.group())
+                    c["date"] = today_ve
+                    return c["rate"]
+        if price_el:
+            import re
+            text = price_el.text.strip().replace(".", "").replace(",", ".")
+            match = re.search(r"[\d.]+", text)
+            if match:
+                price = float(match.group())
+                c["rate"] = price
+                c["date"] = today_ve
+                logger.info(f"Binance actualizado {today_ve}: {price}")
+                return price
+        logger.warning("No se pudo scrapear tasa Binance")
         return c["rate"]
     except Exception as e:
-        logger.error(f"Error Binance: {e}")
+        logger.error(f"Error Binance scraping: {e}")
         return c["rate"]
 
-
-# ── Suscripción ──────────────────────────────────────────────────────────────
-
-async def check_suscripcion(user_id: int, context) -> bool:
-    try:
-        member = await context.bot.get_chat_member(chat_id=CANAL, user_id=user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as e:
-        logger.warning(f"No se pudo verificar suscripción: {e}")
-        return False
-
-async def pedir_suscripcion(update: Update):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
-        [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
-    ])
-    await update.message.reply_text(
-        "⚠️ Para usar este bot necesitas estar suscrito a nuestro canal.\n\n"
-        "Una vez suscrito, presiona el botón *'Ya me suscribí'* para continuar.",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-
-# ── Comandos públicos ────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-    await update.message.reply_text(
-        "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través del comando /bcv, "
-        "calcular cuánto es en bolívares cierta cantidad de dólares o euros con /calcular, "
-        "y convertir bolívares a dólares o euros con /convertir"
-    )
-
-async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-    rates   = fetch_bcv_rates()
-    binance = fetch_binance_rate()
-    if not rates:
-        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
-        return
-    usd_str     = format_number(rates["USD"]) if rates.get("USD") else "No disponible"
-    eur_str     = format_number(rates["EUR"]) if rates.get("EUR") else "No disponible"
-    binance_str = format_number(binance)      if binance           else "No disponible"
-    msg = (
-        f"*TASAS DEL DÍA*\n"
-        f"📅 {get_date_str()}\n\n"
-        f"🇪🇺 Euro: Bs. {eur_str}\n"
-        f"🇺🇸 Dólar: Bs. {usd_str}\n"
-        f"💲 Binance / USDT: Bs. {binance_str}"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Indica la cantidad y moneda.\nEjemplos:\n"
-            "/calcular 20 — dólares BCV (por defecto)\n"
-            "/calcular 20 eur — euros BCV\n"
-            "/calcular 20 usdt — Binance/USDT"
-        )
-        return
-    try:
-        cantidad = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Valor no válido. Ejemplo: /calcular 20")
-        return
-    moneda = args[1].lower() if len(args) > 1 else "usd"
-    if moneda in ("eur", "euro", "euros", "€"):
-        rates = fetch_bcv_rates()
-        tasa = rates.get("EUR") if rates else None
-        simbolo = "€"; fuente = "BCV"
-    elif moneda in ("usdt", "binance", "crypto"):
-        tasa = fetch_binance_rate()
-        simbolo = "USDT"; fuente = "Binance"
-    else:
-        rates = fetch_bcv_rates()
-        tasa = rates.get("USD") if rates else None
-        simbolo = "$"; fuente = "BCV"
-    if not tasa:
-        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
-        return
-    cant_str = str(int(cantidad)) if cantidad == int(cantidad) else str(cantidad)
-    msg = f"{cant_str} {simbolo} ({fuente}) en bolívares serían: Bs. {format_number(cantidad * tasa)}"
-    await update.message.reply_text(msg)
-
-async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Indica la cantidad en bolívares y la moneda destino.\nEjemplos:\n"
-            "/convertir 10000 — Bs. a dólares BCV (por defecto)\n"
-            "/convertir 10000 eur — Bs. a euros BCV\n"
-            "/convertir 10000 usdt — Bs. a Binance/USDT"
-        )
-        return
-    try:
-        cantidad = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Valor no válido. Ejemplo: /convertir 10000")
-        return
-    moneda = args[1].lower() if len(args) > 1 else "usd"
-    if moneda in ("eur", "euro", "euros", "€"):
-        rates = fetch_bcv_rates()
-        tasa = rates.get("EUR") if rates else None
-        simbolo = "€"; nombre = "euros (BCV)"
-    elif moneda in ("usdt", "binance", "crypto"):
-        tasa = fetch_binance_rate()
-        simbolo = "USDT"; nombre = "Binance / USDT"
-    else:
-        rates = fetch_bcv_rates()
-        tasa = rates.get("USD") if rates else None
-        simbolo = "$"; nombre = "dólares (BCV)"
-    if not tasa:
-        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
-        return
-    msg = f"Bs. {format_number(cantidad)} en {nombre} serían: {simbolo}{format_number(cantidad / tasa)}"
-    await update.message.reply_text(msg)
-
-async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if await check_suscripcion(query.from_user.id, context):
-        await query.edit_message_text(
-            "✅ ¡Suscripción verificada! Ya puedes usar todos los comandos:\n\n"
-            "/bcv — Ver tasas del día\n"
-            "/calcular 20 — USD a Bs.\n"
-            "/calcular 20 eur — EUR a Bs.\n"
-            "/calcular 20 usdt — Binance/USDT a Bs.\n"
-            "/convertir 10000 — Bs. a USD\n"
-            "/convertir 10000 usdt — Bs. a USDT"
-        )
-    else:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
-            [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
-        ])
-        await query.edit_message_text(
-            "❌ Aún no estás suscrito al canal. Suscríbete y vuelve a intentarlo.",
-            reply_markup=keyboard
-        )
-
-
-# ── Panel de Administrador (/gfa) ────────────────────────────────────────────
 
 def admin_menu_keyboard():
     return InlineKeyboardMarkup([
