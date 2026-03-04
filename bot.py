@@ -81,26 +81,23 @@ def fetch_bcv_rates():
     try:
         rates = {}
 
-        # USD desde pyDolarVenezuela BCV
+        # USD y EUR desde pyDolarVenezuela BCV (get_all_monitors devuelve ambos)
         try:
-            usd = Monitor(BCV, 'USD').get_value_monitors("usd")
-            if usd and usd.price:
-                rates["USD"] = float(usd.price)
+            all_monitors = Monitor(BCV, 'USD').get_all_monitors()
+            items = list(vars(all_monitors).items()) if hasattr(all_monitors, '__dict__') else []
+            if isinstance(all_monitors, list):
+                items = [(getattr(i, 'key', getattr(i, 'title', '')), i) for i in all_monitors]
+            for key, val in items:
+                key_lower = str(key).lower()
+                price = getattr(val, 'price', None)
+                if not price:
+                    continue
+                if 'usd' in key_lower or 'dolar' in key_lower or 'dollar' in key_lower:
+                    rates["USD"] = float(price)
+                elif 'eur' in key_lower or 'euro' in key_lower:
+                    rates["EUR"] = float(price)
         except Exception as e:
-            logger.error(f"Error USD BCV: {e}")
-
-        # EUR scraping directo bcv.org.ve
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            r = requests.get("https://www.bcv.org.ve/", headers=headers, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            euro_div = soup.find("div", {"id": "euro"})
-            if euro_div:
-                strong = euro_div.find("strong")
-                if strong:
-                    rates["EUR"] = float(strong.text.strip().replace(",", "."))
-        except Exception as e:
-            logger.error(f"Error EUR scraping: {e}")
+            logger.error(f"Error BCV monitors: {e}")
 
         if rates:
             c["rates"] = rates
@@ -114,42 +111,39 @@ def fetch_bcv_rates():
 
 
 def fetch_binance_rate():
+    """Obtiene precio USDT/VES desde la API P2P oficial de Binance."""
     today_ve = get_ve_now().date()
     c = _cache["binance"]
     if c["rate"] and c["date"] == today_ve:
         return c["rate"]
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get("https://exchangemonitor.net/venezuela/dolar-binance", headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        price = None
-        # Buscar el valor en varios selectores posibles
-        for selector in [
-            ("p",   {"class": "specific-value"}),
-            ("div", {"class": "price"}),
-            ("span",{"class": "price"}),
-            ("p",   {"class": "value"}),
-        ]:
-            el = soup.find(selector[0], selector[1])
-            if el:
-                text = el.text.strip().replace(".", "").replace(",", ".")
-                m = re.search(r"[\d.]+", text)
-                if m:
-                    price = float(m.group())
-                    break
-
-        if price:
+        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+        payload = {
+            "asset": "USDT",
+            "fiat": "VES",
+            "merchantCheck": False,
+            "page": 1,
+            "publishType": "BUY",
+            "rows": 5,
+            "tradeType": "BUY"
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        data = r.json()
+        prices = [float(ad["adv"]["price"]) for ad in data.get("data", []) if ad.get("adv", {}).get("price")]
+        if prices:
+            price = sum(prices) / len(prices)  # promedio de los primeros anuncios
             c["rate"] = price
             c["date"] = today_ve
-            logger.info(f"Binance actualizado {today_ve}: {price}")
+            logger.info(f"Binance P2P actualizado {today_ve}: {price}")
             return price
-
-        logger.warning("No se pudo scrapear tasa Binance de exchangemonitor.net")
+        logger.warning("No se obtuvieron precios de Binance P2P")
         return c["rate"]
-
     except Exception as e:
-        logger.error(f"Error Binance scraping: {e}")
+        logger.error(f"Error Binance P2P: {e}")
         return c["rate"]
 
 
