@@ -13,7 +13,10 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 from pyDolarVenezuela.pages import BCV
 from pyDolarVenezuela import Monitor
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("__main__").setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 VE_TZ     = timezone(timedelta(hours=-4))
@@ -28,6 +31,22 @@ _cache = {
     "bcv":     {"rates": None, "date": None},
     "binance": {"rate":  None, "date": None},
 }
+
+
+def get_cache_date():
+    """
+    Devuelve la fecha efectiva para el cache:
+    - Sábado (5) y domingo (6) → usa el viernes anterior
+    - Resto de días → fecha actual Venezuela
+    """
+    now = get_ve_now()
+    weekday = now.weekday()  # 0=lun, 4=vie, 5=sab, 6=dom
+    if weekday == 5:   # sábado → viernes
+        return (now - timedelta(days=1)).date()
+    elif weekday == 6: # domingo → viernes
+        return (now - timedelta(days=2)).date()
+    else:
+        return now.date()
 
 
 # ── HTTP server para UptimeRobot ─────────────────────────────────────────────
@@ -74,35 +93,38 @@ def get_date_str():
 # ── Tasas ────────────────────────────────────────────────────────────────────
 
 def fetch_bcv_rates():
-    today_ve = get_ve_now().date()
+    cache_date = get_cache_date()
     c = _cache["bcv"]
-    if c["rates"] and c["date"] == today_ve:
+
+    # Si ya tenemos rates del viernes (o del día actual), no volver a pedir
+    if c["rates"] and c["date"] == cache_date:
         return c["rates"]
+
+    # Fin de semana y ya tenemos algo en cache → no hacer requests
+    weekday = get_ve_now().weekday()
+    if weekday in (5, 6) and c["rates"]:
+        return c["rates"]
+
     try:
         rates = {}
-
-        # USD y EUR desde pyDolarVenezuela BCV (get_all_monitors devuelve ambos)
-        try:
-            all_monitors = Monitor(BCV, 'USD').get_all_monitors()
-            items = list(vars(all_monitors).items()) if hasattr(all_monitors, '__dict__') else []
-            if isinstance(all_monitors, list):
-                items = [(getattr(i, 'key', getattr(i, 'title', '')), i) for i in all_monitors]
-            for key, val in items:
-                key_lower = str(key).lower()
-                price = getattr(val, 'price', None)
-                if not price:
-                    continue
-                if 'usd' in key_lower or 'dolar' in key_lower or 'dollar' in key_lower:
-                    rates["USD"] = float(price)
-                elif 'eur' in key_lower or 'euro' in key_lower:
-                    rates["EUR"] = float(price)
-        except Exception as e:
-            logger.error(f"Error BCV monitors: {e}")
+        all_monitors = Monitor(BCV, 'USD').get_all_monitors()
+        items = list(vars(all_monitors).items()) if hasattr(all_monitors, '__dict__') else []
+        if isinstance(all_monitors, list):
+            items = [(getattr(i, 'key', getattr(i, 'title', '')), i) for i in all_monitors]
+        for key, val in items:
+            key_lower = str(key).lower()
+            price = getattr(val, 'price', None)
+            if not price:
+                continue
+            if 'usd' in key_lower or 'dolar' in key_lower or 'dollar' in key_lower:
+                rates["USD"] = float(price)
+            elif 'eur' in key_lower or 'euro' in key_lower:
+                rates["EUR"] = float(price)
 
         if rates:
             c["rates"] = rates
-            c["date"]  = today_ve
-            logger.info(f"Tasas BCV actualizadas {today_ve}: {rates}")
+            c["date"]  = cache_date
+            logger.info(f"Tasas BCV actualizadas {cache_date}: {rates}")
         return rates or c["rates"]
 
     except Exception as e:
@@ -112,9 +134,13 @@ def fetch_bcv_rates():
 
 def fetch_binance_rate():
     """Obtiene precio USDT/VES desde la API P2P oficial de Binance."""
-    today_ve = get_ve_now().date()
+    cache_date = get_cache_date()
     c = _cache["binance"]
-    if c["rate"] and c["date"] == today_ve:
+    if c["rate"] and c["date"] == cache_date:
+        return c["rate"]
+    # Fin de semana y ya tenemos algo en cache → no hacer requests
+    weekday = get_ve_now().weekday()
+    if weekday in (5, 6) and c["rate"]:
         return c["rate"]
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
@@ -137,8 +163,8 @@ def fetch_binance_rate():
         if prices:
             price = sum(prices) / len(prices)  # promedio de los primeros anuncios
             c["rate"] = price
-            c["date"] = today_ve
-            logger.info(f"Binance P2P actualizado {today_ve}: {price}")
+            c["date"] = cache_date
+            logger.info(f"Binance P2P actualizado {cache_date}: {price}")
             return price
         logger.warning("No se obtuvieron precios de Binance P2P")
         return c["rate"]
@@ -478,7 +504,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
 
     logger.info("Bot iniciado...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=20)
 
 
 if __name__ == "__main__":
