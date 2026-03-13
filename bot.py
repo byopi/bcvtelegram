@@ -36,17 +36,26 @@ _cache = {
 def get_cache_date():
     """
     Devuelve la fecha efectiva para el cache:
-    - Sábado (5) y domingo (6) → usa el viernes anterior
-    - Resto de días → fecha actual Venezuela
+    - Lunes a viernes → fecha actual Venezuela
+    - Sábado (5) → viernes (ayer)
+    - Domingo (6) → viernes (anteayer)
+    Así el cache del viernes se reutiliza todo el fin de semana.
     """
     now = get_ve_now()
-    weekday = now.weekday()  # 0=lun, 4=vie, 5=sab, 6=dom
-    if weekday == 5:   # sábado → viernes
-        return (now - timedelta(days=1)).date()
-    elif weekday == 6: # domingo → viernes
-        return (now - timedelta(days=2)).date()
-    else:
-        return now.date()
+    weekday = now.weekday()  # 0=lun ... 4=vie, 5=sab, 6=dom
+    if weekday == 5:
+        return (now - timedelta(days=1)).date()   # sábado → viernes
+    elif weekday == 6:
+        return (now - timedelta(days=2)).date()   # domingo → viernes
+    return now.date()
+
+
+def should_fetch():
+    """
+    Solo hace requests externos de lunes a viernes.
+    Sábado y domingo usa lo que haya en cache sin llamar a nadie.
+    """
+    return get_ve_now().weekday() < 5  # 0-4 = lun-vie
 
 
 # ── HTTP server para UptimeRobot ─────────────────────────────────────────────
@@ -100,9 +109,8 @@ def fetch_bcv_rates():
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
 
-    # Fin de semana y ya tenemos algo en cache → no hacer requests
-    weekday = get_ve_now().weekday()
-    if weekday in (5, 6) and c["rates"]:
+    # Fin de semana → devolver cache sin hacer requests
+    if not should_fetch() and c["rates"]:
         return c["rates"]
 
     try:
@@ -138,9 +146,8 @@ def fetch_binance_rate():
     c = _cache["binance"]
     if c["rate"] and c["date"] == cache_date:
         return c["rate"]
-    # Fin de semana y ya tenemos algo en cache → no hacer requests
-    weekday = get_ve_now().weekday()
-    if weekday in (5, 6) and c["rate"]:
+    # Fin de semana → devolver cache sin hacer requests
+    if not should_fetch() and c["rate"]:
         return c["rate"]
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
@@ -464,12 +471,21 @@ async def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def preload_rates():
+    """Precarga las tasas al arrancar para que estén disponibles de inmediato."""
+    logger.info("Precargando tasas...")
+    fetch_bcv_rates()
+    fetch_binance_rate()
+    logger.info("Tasas precargadas.")
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
 
     threading.Thread(target=run_http_server, daemon=True).start()
+    preload_rates()
 
     app = Application.builder().token(token).build()
 
