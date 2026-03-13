@@ -26,36 +26,79 @@ CANAL_URL = "https://t.me/botsgfa"
 # Estados ConversationHandler admin
 (ADMIN_MENU, ESPERANDO_MSG_GLOBAL, ESPERANDO_USUARIO, ESPERANDO_MSG_USUARIO) = range(4)
 
-# Cache
+# Cache en memoria + archivo para persistir entre reinicios
+CACHE_FILE = "/tmp/rates_cache.json"
+
 _cache = {
     "bcv":     {"rates": None, "date": None},
     "binance": {"rate":  None, "date": None},
 }
 
 
-def get_cache_date():
+def save_cache():
+    """Guarda el cache en disco."""
+    import json
+    try:
+        data = {
+            "bcv_rates": _cache["bcv"]["rates"],
+            "bcv_date":  str(_cache["bcv"]["date"]) if _cache["bcv"]["date"] else None,
+            "bin_rate":  _cache["binance"]["rate"],
+            "bin_date":  str(_cache["binance"]["date"]) if _cache["binance"]["date"] else None,
+        }
+        with open(CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar cache: {e}")
+
+
+def load_cache():
+    """Carga el cache desde disco al arrancar."""
+    import json
+    from datetime import date
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("bcv_rates") and data.get("bcv_date"):
+            _cache["bcv"]["rates"] = data["bcv_rates"]
+            _cache["bcv"]["date"]  = date.fromisoformat(data["bcv_date"])
+        if data.get("bin_rate") and data.get("bin_date"):
+            _cache["binance"]["rate"] = data["bin_rate"]
+            _cache["binance"]["date"] = date.fromisoformat(data["bin_date"])
+        logger.info(f"Cache cargado: BCV={_cache['bcv']['rates']} Binance={_cache['binance']['rate']}")
+    except Exception:
+        logger.info("No hay cache previo, se obtendrán tasas frescas.")
+
+
+def get_effective_date():
     """
-    Devuelve la fecha efectiva para el cache:
-    - Lunes a viernes → fecha actual Venezuela
-    - Sábado (5) → viernes (ayer)
-    - Domingo (6) → viernes (anteayer)
-    Así el cache del viernes se reutiliza todo el fin de semana.
+    Fecha efectiva de la tasa:
+    - Lunes a viernes → hoy
+    - Sábado → viernes anterior
+    - Domingo → viernes anterior
     """
     now = get_ve_now()
-    weekday = now.weekday()  # 0=lun ... 4=vie, 5=sab, 6=dom
+    weekday = now.weekday()
     if weekday == 5:
-        return (now - timedelta(days=1)).date()   # sábado → viernes
+        return (now - timedelta(days=1)).date()
     elif weekday == 6:
-        return (now - timedelta(days=2)).date()   # domingo → viernes
+        return (now - timedelta(days=2)).date()
     return now.date()
 
 
 def should_fetch():
     """
-    Solo hace requests externos de lunes a viernes.
-    Sábado y domingo usa lo que haya en cache sin llamar a nadie.
+    Fetch solo de lunes a viernes, y solo si aún no hemos
+    cargado la tasa de hoy. Una vez cargada, no vuelve a pedir
+    hasta las 00:00 VE del día siguiente.
+    Fin de semana → nunca hace fetch, usa cache del viernes.
     """
-    return get_ve_now().weekday() < 5  # 0-4 = lun-vie
+    now = get_ve_now()
+    if now.weekday() >= 5:  # sábado o domingo
+        return False
+    # Solo permite fetch si el cache es de un día anterior
+    cached_date = _cache["bcv"]["date"]
+    effective = get_effective_date()
+    return cached_date != effective
 
 
 # ── HTTP server para UptimeRobot ─────────────────────────────────────────────
@@ -102,15 +145,15 @@ def get_date_str():
 # ── Tasas ────────────────────────────────────────────────────────────────────
 
 def fetch_bcv_rates():
-    cache_date = get_cache_date()
     c = _cache["bcv"]
+    cache_date = get_effective_date()
 
-    # Si ya tenemos rates del viernes (o del día actual), no volver a pedir
+    # Ya tenemos la tasa de hoy (o del viernes si es fin de semana) → no tocar
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
 
-    # Fin de semana → devolver cache sin hacer requests
-    if not should_fetch() and c["rates"]:
+    # Si no debemos hacer fetch (fin de semana o ya fue cargada hoy) → cache
+    if not should_fetch():
         return c["rates"]
 
     try:
@@ -133,6 +176,7 @@ def fetch_bcv_rates():
             c["rates"] = rates
             c["date"]  = cache_date
             logger.info(f"Tasas BCV actualizadas {cache_date}: {rates}")
+            save_cache()
         return rates or c["rates"]
 
     except Exception as e:
@@ -141,14 +185,14 @@ def fetch_bcv_rates():
 
 
 def fetch_binance_rate():
-    """Obtiene precio USDT/VES desde la API P2P oficial de Binance."""
-    cache_date = get_cache_date()
+    """Obtiene precio USDT/VES desde la API P2P oficial de Binance (tiempo real)."""
     c = _cache["binance"]
-    if c["rate"] and c["date"] == cache_date:
-        return c["rate"]
-    # Fin de semana → devolver cache sin hacer requests
-    if not should_fetch() and c["rate"]:
-        return c["rate"]
+    # Binance: cachear 5 minutos máximo para que sea tiempo real
+    now_ve = get_ve_now()
+    if c["rate"] and c["date"] == now_ve.date():
+        cached_ts = _cache["binance"].get("ts")
+        if cached_ts and (now_ve.timestamp() - cached_ts) < 300:
+            return c["rate"]
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
         payload = {
@@ -170,8 +214,9 @@ def fetch_binance_rate():
         if prices:
             price = sum(prices) / len(prices)  # promedio de los primeros anuncios
             c["rate"] = price
-            c["date"] = cache_date
-            logger.info(f"Binance P2P actualizado {cache_date}: {price}")
+            c["date"] = now_ve.date()
+            c["ts"]   = now_ve.timestamp()
+            logger.info(f"Binance P2P actualizado: {price}")
             return price
         logger.warning("No se obtuvieron precios de Binance P2P")
         return c["rate"]
@@ -472,11 +517,11 @@ async def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def preload_rates():
-    """Precarga las tasas al arrancar para que estén disponibles de inmediato."""
-    logger.info("Precargando tasas...")
+    """Carga cache del disco y fetch si hace falta."""
+    load_cache()
     fetch_bcv_rates()
     fetch_binance_rate()
-    logger.info("Tasas precargadas.")
+    logger.info(f"Tasas listas: BCV={_cache['bcv']['rates']} Binance={_cache['binance']['rate']}")
 
 
 def main():
