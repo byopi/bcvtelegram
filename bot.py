@@ -514,6 +514,45 @@ async def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["usuarios"].add(update.effective_user.id)
 
 
+# ── Comando /settasa (solo admin) ────────────────────────────────────────────
+
+async def settasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+
+    args = context.args
+    if not args:
+        rates = _cache["bcv"]["rates"] or {}
+        usd_str = format_number(rates["USD"]) if rates.get("USD") else "N/A"
+        eur_str = format_number(rates["EUR"]) if rates.get("EUR") else "N/A"
+        msg = "Tasas actuales en cache:\nUSD: Bs. " + usd_str + "\nEUR: Bs. " + eur_str + "\n\nUso: /settasa 443.26 510.34"
+        await update.message.reply_text(msg)
+        return
+
+    try:
+        usd = float(args[0].replace(",", "."))
+        eur = float(args[1].replace(",", ".")) if len(args) > 1 else (_cache["bcv"]["rates"] or {}).get("EUR")
+    except (ValueError, IndexError):
+        await update.message.reply_text("Formato invalido. Ejemplo: /settasa 443.26 510.34")
+        return
+
+    rates = {}
+    if usd:
+        rates["USD"] = usd
+    if eur:
+        rates["EUR"] = eur
+
+    effective = get_effective_date()
+    _cache["bcv"]["rates"] = rates
+    _cache["bcv"]["date"]  = effective
+    save_cache()
+
+    usd_str = format_number(usd)
+    eur_str = format_number(eur) if eur else "N/A"
+    msg = "Tasas fijadas manualmente:\nUSD: Bs. " + usd_str + "\nEUR: Bs. " + eur_str + "\nFecha efectiva: " + str(effective)
+    await update.message.reply_text(msg)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def preload_rates():
@@ -535,6 +574,7 @@ def main():
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("settasa",   settasa))
     app.add_handler(CommandHandler("bcv",       bcv))
     app.add_handler(CommandHandler("calcular",  calcular))
     app.add_handler(CommandHandler("convertir", convertir))
