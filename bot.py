@@ -250,6 +250,8 @@ async def pedir_suscripcion(update):
 
 # ── Comandos públicos ────────────────────────────────────────────────────────
 
+# ── Comandos públicos ────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_privado(update):
         if not await check_suscripcion(update.effective_user.id, context):
@@ -421,6 +423,27 @@ async def gfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_menu_keyboard()
     )
     return ADMIN_MENU
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # VALIDACIÓN SOLO ADMIN
+    if not es_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Uso: /ban ID_DEL_USUARIO")
+        return
+
+    try:
+        uid_to_ban = int(context.args[0])
+        if "blacklist" not in _cache:
+            _cache["blacklist"] = set()
+        
+        _cache["blacklist"].add(uid_to_ban)
+        save_cache() # Persistimos el baneo
+        
+        await update.message.reply_text(f"🚫 Usuario {uid_to_ban} ha sido enviado a la lista negra.")
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser numérico.")
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
