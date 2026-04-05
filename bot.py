@@ -180,57 +180,69 @@ def fetch_bcv_rates():
     c = _cache["bcv"]
     cache_date = get_effective_date()
 
+    # Si ya tenemos la tasa de hoy en cache, no buscamos nada
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
+    
+    # Si es fin de semana, usamos lo último que tengamos
     if not should_fetch():
         return c["rates"]
 
     try:
-        # Configurar proxies si existe la variable
-        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        # Configurar proxies correctamente para pyDolarVenezuela
+        # La librería espera un diccionario o None
+        pdv_proxy = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
         
-        # Inicializar Monitor de pyDolarVenezuela usando la página del BCV
-        # Se pasa el diccionario de proxies directamente a la instancia
-        monitor = Monitor(page=BCV, proxies=proxies)
+        # Instanciar el monitor con el proxy
+        monitor = Monitor(page=BCV, proxies=pdv_proxy)
+        
+        # Obtener los datos
         data = monitor.get_all_monitors()
         
         rates = {}
-        # pyDolarVenezuela devuelve una lista de diccionarios o un objeto mapeado
-        # Filtramos USD y EUR según la estructura de la librería
         for m in data:
-            if m.key == 'usd':
-                rates["USD"] = float(m.price)
-            elif m.key == 'eur':
-                rates["EUR"] = float(m.price)
+            # pyDolarVenezuela usa objetos con atributo 'key' y 'price'
+            key = getattr(m, 'key', '').lower()
+            price = getattr(m, 'price', 0)
+            
+            if key == 'usd':
+                rates["USD"] = float(price)
+            elif key == 'eur':
+                rates["EUR"] = float(price)
 
-        if rates:
+        if rates.get("USD") and rates.get("EUR"):
             c["rates"] = rates
             c["date"]  = cache_date
             save_cache()
-            logger.info(f"Tasas BCV actualizadas via pyDolar: {rates}")
-        return rates or c["rates"]
-
-    except Exception as e:
-        logger.error(f"Error con pyDolarVenezuela: {e}")
-        # Intentar fallback tradicional si pyDolar falla
-        try:
-            r = requests.get("https://www.bcv.org.ve/", headers={"User-Agent": "Mozilla/5.0"}, 
-                             proxies={"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None,
-                             timeout=15, verify=False)
-            soup = BeautifulSoup(r.text, "html.parser")
-            fallback_rates = {}
-            usd_div = soup.find("div", {"id": "dolar"})
-            if usd_div: fallback_rates["USD"] = float(usd_div.find("strong").text.strip().replace(",", "."))
-            eur_div = soup.find("div", {"id": "euro"})
-            if eur_div: fallback_rates["EUR"] = float(eur_div.find("strong").text.strip().replace(",", "."))
+            logger.info(f"✅ Tasas actualizadas: {rates}")
+            return rates
             
-            if fallback_rates:
-                c["rates"], c["date"] = fallback_rates, cache_date
-                save_cache()
-                return fallback_rates
-        except:
-            pass
-        return c["rates"]
+    except Exception as e:
+        logger.error(f"⚠️ Error en pyDolar (Proxy?): {e}")
+
+    # --- FALLBACK (Si lo de arriba falla, intentamos scraping directo) ---
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        
+        r = requests.get("https://www.bcv.org.ve/", headers=headers, proxies=proxies, timeout=15, verify=False)
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        fallback = {}
+        usd_div = soup.find("div", {"id": "dolar"})
+        eur_div = soup.find("div", {"id": "euro"})
+        
+        if usd_div: fallback["USD"] = float(usd_div.find("strong").text.strip().replace(",", "."))
+        if eur_div: fallback["EUR"] = float(eur_div.find("strong").text.strip().replace(",", "."))
+        
+        if fallback:
+            c["rates"], c["date"] = fallback, cache_date
+            save_cache()
+            return fallback
+    except Exception as e:
+        logger.error(f"❌ Fallback fallido: {e}")
+        
+    return c["rates"] # Retorna lo que haya en memoria si todo falla
 
 
 def fetch_binance_rate():
@@ -415,4 +427,53 @@ def main():
     app.run_polling(poll_interval=2.0)
 
 if __name__ == "__main__":
-    main()
+    load_cache()
+    
+    # Hilo para el servidor HTTP (Evita que Render mate el proceso)
+    threading.Thread(target=run_http_server, daemon=True).start()
+    
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("No se encontró TELEGRAM_BOT_TOKEN")
+        exit(1)
+
+    # Construcción de la aplicación
+    app = Application.builder().token(token).build()
+
+    # Comandos públicos
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("settasa",   settasa))
+    app.add_handler(CommandHandler("bcv",       bcv))
+    app.add_handler(CommandHandler("calcular",  calcular))
+    app.add_handler(CommandHandler("convertir", convertir))
+    app.add_handler(CommandHandler("banear",    banear))
+    app.add_handler(CommandHandler("desbanear", desbanear))
+    app.add_handler(CommandHandler("baneados",  lista_baneados))
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+
+    # Panel Admin
+    admin_conv = ConversationHandler(
+        entry_points=[CommandHandler("gfa", gfa)],
+        states={
+            ADMIN_MENU: [CallbackQueryHandler(admin_callback, pattern="^admin_")],
+            ESPERANDO_MSG_GLOBAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_global),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+            ESPERANDO_USUARIO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_usuario_destino),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+            ESPERANDO_MSG_USUARIO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_usuario),
+                CommandHandler("cancelar", cancelar_admin),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar_admin)],
+    )
+    app.add_handler(admin_conv)
+    app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
+
+    # Ejecución estable
+    logger.info("Bot en marcha...")
+    app.run_polling(drop_pending_updates=True)
