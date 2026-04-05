@@ -601,6 +601,7 @@ def main():
     app.add_handler(CommandHandler("bcv",       bcv))
     app.add_handler(CommandHandler("calcular",  calcular))
     app.add_handler(CommandHandler("convertir", convertir))
+    app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
 
     admin_conv = ConversationHandler(
