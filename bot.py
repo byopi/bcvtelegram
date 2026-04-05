@@ -3,6 +3,8 @@ import re
 import logging
 import threading
 import requests
+import time
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -35,8 +37,177 @@ _cache = {
 }
 
 
+# ── Antiflood ─────────────────────────────────────────────────────────────────
+# Máximo de mensajes permitidos por ventana de tiempo
+FLOOD_MAX_MSGS   = 3       # mensajes permitidos
+FLOOD_WINDOW_SEC = 10      # ventana en segundos
+FLOOD_MUTE_SEC   = 30      # tiempo de silencio tras hacer flood
+
+# Estructura: {user_id: {"timestamps": [...], "muted_until": float}}
+_flood_data: dict = defaultdict(lambda: {"timestamps": [], "muted_until": 0.0})
+
+def check_flood(user_id: int) -> bool:
+    """
+    Devuelve True si el usuario está haciendo flood (debe ser ignorado).
+    Limpia mensajes fuera de la ventana y aplica mute si supera el límite.
+    """
+    now = time.monotonic()
+    data = _flood_data[user_id]
+
+    # Si está muteado todavía
+    if now < data["muted_until"]:
+        return True
+
+    # Limpiar timestamps fuera de la ventana
+    data["timestamps"] = [t for t in data["timestamps"] if now - t < FLOOD_WINDOW_SEC]
+
+    # Registrar este mensaje
+    data["timestamps"].append(now)
+
+    # Verificar límite
+    if len(data["timestamps"]) > FLOOD_MAX_MSGS:
+        data["muted_until"] = now + FLOOD_MUTE_SEC
+        data["timestamps"]  = []
+        logger.info(f"Flood detectado: usuario {user_id} muteado {FLOOD_MUTE_SEC}s")
+        return True
+
+    return False
+
+
+# ── Sistema de Ban ────────────────────────────────────────────────────────────
+# Persiste en memoria de bot_data bajo la clave "baneados" (set de int user_id)
+
+def get_baneados(context: ContextTypes.DEFAULT_TYPE) -> set:
+    if "baneados" not in context.bot_data:
+        context.bot_data["baneados"] = set()
+    return context.bot_data["baneados"]
+
+def esta_baneado(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return user_id in get_baneados(context)
+
+
+async def banear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admin. Uso: /banear <ID o @username>"""
+    if not es_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Debes indicar el ID o @username.\n"
+            "Ejemplo: `/banear 123456789` o `/banear @usuario`",
+            parse_mode="Markdown"
+        )
+        return
+
+    objetivo = context.args[0].strip()
+    baneados = get_baneados(context)
+
+    # Resolver ID numérico o @username
+    if objetivo.lstrip("-").isdigit():
+        ban_id = int(objetivo)
+        ban_label = str(ban_id)
+    elif objetivo.startswith("@"):
+        # Guardar el username tal cual; se usará para bloquear cuando escriba
+        ban_id    = objetivo.lower()
+        ban_label = objetivo
+    else:
+        await update.message.reply_text("❌ Formato inválido. Usa un ID numérico o @username.")
+        return
+
+    if ban_id in baneados:
+        await update.message.reply_text(f"⚠️ `{ban_label}` ya está baneado.", parse_mode="Markdown")
+        return
+
+    baneados.add(ban_id)
+    logger.info(f"Admin baneó: {ban_label}")
+    await update.message.reply_text(
+        f"🔨 Usuario `{ban_label}` baneado correctamente.\n"
+        f"Usa /desbanear para revertirlo.",
+        parse_mode="Markdown"
+    )
+
+
+async def desbanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admin. Uso: /desbanear <ID o @username>"""
+    if not es_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Debes indicar el ID o @username.\n"
+            "Ejemplo: `/desbanear 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+
+    objetivo = context.args[0].strip()
+    baneados = get_baneados(context)
+
+    ban_id = int(objetivo) if objetivo.lstrip("-").isdigit() else objetivo.lower()
+
+    if ban_id not in baneados:
+        await update.message.reply_text(f"⚠️ `{objetivo}` no está en la lista de baneados.", parse_mode="Markdown")
+        return
+
+    baneados.discard(ban_id)
+    logger.info(f"Admin desbaneó: {objetivo}")
+    await update.message.reply_text(f"✅ Usuario `{objetivo}` desbaneado.", parse_mode="Markdown")
+
+
+async def lista_baneados(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admin. Muestra la lista de usuarios baneados."""
+    if not es_admin(update.effective_user.id):
+        return
+
+    baneados = get_baneados(context)
+    if not baneados:
+        await update.message.reply_text("✅ No hay usuarios baneados actualmente.")
+        return
+
+    lineas = [f"• `{b}`" for b in sorted(baneados, key=str)]
+    texto  = "🔨 *Usuarios baneados:*\n\n" + "\n".join(lineas)
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+# ── Guard: antiflood + ban (decorador reutilizable) ───────────────────────────
+
+async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Devuelve True si el update debe ser BLOQUEADO (flood o ban).
+    Envía aviso de flood UNA sola vez (cuando se aplica el mute).
+    """
+    user = update.effective_user
+    if not user:
+        return False
+
+    # Verificar ban por ID
+    if esta_baneado(user.id, context):
+        return True
+
+    # Verificar ban por @username
+    if user.username and ("@" + user.username.lower()) in get_baneados(context):
+        return True
+
+    # Verificar flood
+    now  = time.monotonic()
+    data = _flood_data[user.id]
+    prev_muted = now < data["muted_until"]
+
+    if check_flood(user.id):
+        # Solo avisar cuando se aplica el mute (primera vez)
+        if not prev_muted and update.message:
+            await update.message.reply_text(
+                f"⏳ Estás enviando mensajes muy rápido. "
+                f"Espera {FLOOD_MUTE_SEC} segundos antes de continuar."
+            )
+        return True
+
+    return False
+
+
+# ── Cache utils ──────────────────────────────────────────────────────────────
+
 def save_cache():
-    """Guarda el cache en disco."""
     import json
     try:
         data = {
@@ -52,7 +223,6 @@ def save_cache():
 
 
 def load_cache():
-    """Carga el cache desde disco al arrancar."""
     import json
     from datetime import date
     try:
@@ -70,12 +240,6 @@ def load_cache():
 
 
 def get_effective_date():
-    """
-    Fecha efectiva de la tasa:
-    - Lunes a viernes → hoy
-    - Sábado → viernes anterior
-    - Domingo → viernes anterior
-    """
     now = get_ve_now()
     weekday = now.weekday()
     if weekday == 5:
@@ -86,18 +250,11 @@ def get_effective_date():
 
 
 def should_fetch():
-    """
-    Fetch solo de lunes a viernes, y solo si aún no hemos
-    cargado la tasa de hoy. Una vez cargada, no vuelve a pedir
-    hasta las 00:00 VE del día siguiente.
-    Fin de semana → nunca hace fetch, usa cache del viernes.
-    """
     now = get_ve_now()
-    if now.weekday() >= 5:  # sábado o domingo
+    if now.weekday() >= 5:
         return False
-    # Solo permite fetch si el cache es de un día anterior
     cached_date = _cache["bcv"]["date"]
-    effective = get_effective_date()
+    effective   = get_effective_date()
     return cached_date != effective
 
 
@@ -148,11 +305,9 @@ def fetch_bcv_rates():
     c = _cache["bcv"]
     cache_date = get_effective_date()
 
-    # Ya tenemos la tasa de hoy (o del viernes si es fin de semana) → no tocar
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
 
-    # Si no debemos hacer fetch (fin de semana o ya fue cargada hoy) → cache
     if not should_fetch():
         return c["rates"]
 
@@ -185,9 +340,7 @@ def fetch_bcv_rates():
 
 
 def fetch_binance_rate():
-    """Obtiene precio USDT/VES desde la API P2P oficial de Binance (tiempo real)."""
     c = _cache["binance"]
-    # Binance: cachear 5 minutos máximo para que sea tiempo real
     now_ve = get_ve_now()
     if c["rate"] and c["date"] == now_ve.date():
         cached_ts = _cache["binance"].get("ts")
@@ -212,7 +365,7 @@ def fetch_binance_rate():
         data = r.json()
         prices = [float(ad["adv"]["price"]) for ad in data.get("data", []) if ad.get("adv", {}).get("price")]
         if prices:
-            price = sum(prices) / len(prices)  # promedio de los primeros anuncios
+            price = sum(prices) / len(prices)
             c["rate"] = price
             c["date"] = now_ve.date()
             c["ts"]   = now_ve.timestamp()
@@ -250,9 +403,9 @@ async def pedir_suscripcion(update):
 
 # ── Comandos públicos ────────────────────────────────────────────────────────
 
-# ── Comandos públicos ────────────────────────────────────────────────────────
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _guard(update, context):
+        return
     if es_privado(update):
         if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
@@ -265,6 +418,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _guard(update, context):
+        return
     if es_privado(update):
         if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
@@ -292,6 +447,8 @@ async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _guard(update, context):
+        return
     if es_privado(update):
         if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
@@ -337,6 +494,8 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _guard(update, context):
+        return
     if es_privado(update):
         if not await check_suscripcion(update.effective_user.id, context):
             await pedir_suscripcion(update)
@@ -423,27 +582,6 @@ async def gfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_menu_keyboard()
     )
     return ADMIN_MENU
-
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # VALIDACIÓN SOLO ADMIN
-    if not es_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text("Uso: /ban ID_DEL_USUARIO")
-        return
-
-    try:
-        uid_to_ban = int(context.args[0])
-        if "blacklist" not in _cache:
-            _cache["blacklist"] = set()
-        
-        _cache["blacklist"].add(uid_to_ban)
-        save_cache() # Persistimos el baneo
-        
-        await update.message.reply_text(f"🚫 Usuario {uid_to_ban} ha sido enviado a la lista negra.")
-    except ValueError:
-        await update.message.reply_text("❌ El ID debe ser numérico.")
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -579,7 +717,6 @@ async def settasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def preload_rates():
-    """Carga cache del disco y fetch si hace falta."""
     load_cache()
     fetch_bcv_rates()
     fetch_binance_rate()
@@ -596,12 +733,14 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    app.add_handler(CommandHandler("start",     start))
-    app.add_handler(CommandHandler("settasa",   settasa))
-    app.add_handler(CommandHandler("bcv",       bcv))
-    app.add_handler(CommandHandler("calcular",  calcular))
-    app.add_handler(CommandHandler("convertir", convertir))
-    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("settasa",    settasa))
+    app.add_handler(CommandHandler("bcv",        bcv))
+    app.add_handler(CommandHandler("calcular",   calcular))
+    app.add_handler(CommandHandler("convertir",  convertir))
+    app.add_handler(CommandHandler("banear",     banear))
+    app.add_handler(CommandHandler("desbanear",  desbanear))
+    app.add_handler(CommandHandler("baneados",   lista_baneados))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
 
     admin_conv = ConversationHandler(
