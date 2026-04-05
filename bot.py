@@ -182,10 +182,9 @@ def fetch_bcv_rates():
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
     
-    if not should_fetch():
-        return c["rates"]
-
+    # Intentamos obtener datos
     try:
+        # Si el proxy da problemas, intenta poner PROXY_URL = None temporalmente en Render
         pdv_proxy = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
         monitor = Monitor(page=BCV, proxies=pdv_proxy)
         data = monitor.get_all_monitors()
@@ -194,33 +193,31 @@ def fetch_bcv_rates():
         for m in data:
             key = getattr(m, 'key', '').lower()
             price = getattr(m, 'price', 0)
-            if key == 'usd': rates["USD"] = float(price)
-            elif key == 'eur': rates["EUR"] = float(price)
+            if 'usd' in key: rates["USD"] = float(price)
+            elif 'eur' in key: rates["EUR"] = float(price)
 
-        if rates.get("USD") and rates.get("EUR"):
+        if rates.get("USD"):
             c["rates"], c["date"] = rates, cache_date
             save_cache()
             return rates
-            
     except Exception as e:
         logger.error(f"Error pyDolar: {e}")
 
+    # FALLBACK DIRECTO AL BCV (Si pyDolar falla)
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
         proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-        r = requests.get("https://www.bcv.org.ve/", headers=headers, proxies=proxies, timeout=15, verify=False)
+        r = requests.get("https://www.bcv.org.ve/", timeout=10, proxies=proxies, verify=False)
         soup = BeautifulSoup(r.text, "html.parser")
-        fallback = {}
-        usd_div = soup.find("div", {"id": "dolar"})
-        eur_div = soup.find("div", {"id": "euro"})
-        if usd_div: fallback["USD"] = float(usd_div.find("strong").text.strip().replace(",", "."))
-        if eur_div: fallback["EUR"] = float(eur_div.find("strong").text.strip().replace(",", "."))
-        if fallback:
-            c["rates"], c["date"] = fallback, cache_date
-            save_cache()
-            return fallback
+        
+        usd_val = soup.find("div", id="dolar").find("strong").text.strip().replace(",", ".")
+        eur_val = soup.find("div", id="euro").find("strong").text.strip().replace(",", ".")
+        
+        rates = {"USD": float(usd_val), "EUR": float(eur_val)}
+        c["rates"], c["date"] = rates, cache_date
+        save_cache()
+        return rates
     except Exception as e:
-        logger.error(f"Fallback fallido: {e}")
+        logger.error(f"Error Fallback BCV: {e}")
         
     return c["rates"]
 
