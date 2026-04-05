@@ -307,35 +307,37 @@ def fetch_bcv_rates():
 
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
-
     if not should_fetch():
         return c["rates"]
 
     try:
+        r = requests.get(
+            "https://www.bcv.org.ve/",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+            verify=False  # el cert del BCV a veces falla
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
         rates = {}
-        all_monitors = Monitor(BCV, 'USD').get_all_monitors()
-        items = list(vars(all_monitors).items()) if hasattr(all_monitors, '__dict__') else []
-        if isinstance(all_monitors, list):
-            items = [(getattr(i, 'key', getattr(i, 'title', '')), i) for i in all_monitors]
-        for key, val in items:
-            key_lower = str(key).lower()
-            price = getattr(val, 'price', None)
-            if not price:
-                continue
-            if 'usd' in key_lower or 'dolar' in key_lower or 'dollar' in key_lower:
-                rates["USD"] = float(price)
-            elif 'eur' in key_lower or 'euro' in key_lower:
-                rates["EUR"] = float(price)
+
+        usd_div = soup.find("div", {"id": "dolar"})
+        if usd_div:
+            usd_str = usd_div.find("strong").text.strip().replace(",", ".")
+            rates["USD"] = float(usd_str)
+
+        eur_div = soup.find("div", {"id": "euro"})
+        if eur_div:
+            eur_str = eur_div.find("strong").text.strip().replace(",", ".")
+            rates["EUR"] = float(eur_str)
 
         if rates:
             c["rates"] = rates
             c["date"]  = cache_date
-            logger.info(f"Tasas BCV actualizadas {cache_date}: {rates}")
             save_cache()
         return rates or c["rates"]
 
     except Exception as e:
-        logger.error(f"Error fetch_bcv_rates: {e}")
+        logger.error(f"Error scraping BCV: {e}")
         return c["rates"]
 
 
