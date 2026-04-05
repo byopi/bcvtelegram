@@ -27,7 +27,6 @@ CANAL     = "@botsgfa"
 CANAL_URL = "https://t.me/botsgfa"
 
 # Configuración de Proxy (Añadir en las variables de entorno de Render)
-# Ejemplo: http://usuario:password@host:puerto
 PROXY_URL = os.environ.get("PROXY_URL")
 
 # Estados ConversationHandler admin
@@ -50,9 +49,9 @@ def check_flood(user_id: int) -> bool:
     data = _flood_data[user_id]
     if now < data["muted_until"]:
         return True
-    data["timestamps"] = [t for t in data["timestamps"] if now - t < 10] # ventana 10s
+    data["timestamps"] = [t for t in data["timestamps"] if now - t < 10]
     data["timestamps"].append(now)
-    if len(data["timestamps"]) > 3: # max 3 msgs
+    if len(data["timestamps"]) > 3:
         data["muted_until"] = now + 30
         data["timestamps"]  = []
         return True
@@ -174,75 +173,56 @@ def get_date_str():
     return f"{now.day} de {meses[now.month - 1]} de {now.year}"
 
 
-# ── Tasas (MODIFICADO CON PYDOLARVENEZUELA + PROXY) ──────────────────────────
+# ── Tasas ──
 
 def fetch_bcv_rates():
     c = _cache["bcv"]
     cache_date = get_effective_date()
 
-    # Si ya tenemos la tasa de hoy en cache, no buscamos nada
     if c["rates"] and c["date"] == cache_date:
         return c["rates"]
     
-    # Si es fin de semana, usamos lo último que tengamos
     if not should_fetch():
         return c["rates"]
 
     try:
-        # Configurar proxies correctamente para pyDolarVenezuela
-        # La librería espera un diccionario o None
         pdv_proxy = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
-        
-        # Instanciar el monitor con el proxy
         monitor = Monitor(page=BCV, proxies=pdv_proxy)
-        
-        # Obtener los datos
         data = monitor.get_all_monitors()
         
         rates = {}
         for m in data:
-            # pyDolarVenezuela usa objetos con atributo 'key' y 'price'
             key = getattr(m, 'key', '').lower()
             price = getattr(m, 'price', 0)
-            
-            if key == 'usd':
-                rates["USD"] = float(price)
-            elif key == 'eur':
-                rates["EUR"] = float(price)
+            if key == 'usd': rates["USD"] = float(price)
+            elif key == 'eur': rates["EUR"] = float(price)
 
         if rates.get("USD") and rates.get("EUR"):
-            c["rates"] = rates
-            c["date"]  = cache_date
+            c["rates"], c["date"] = rates, cache_date
             save_cache()
-            logger.info(f"✅ Tasas actualizadas: {rates}")
             return rates
             
     except Exception as e:
-        logger.error(f"⚠️ Error en pyDolar (Proxy?): {e}")
+        logger.error(f"Error pyDolar: {e}")
 
-    # --- FALLBACK (Si lo de arriba falla, intentamos scraping directo) ---
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-        
         r = requests.get("https://www.bcv.org.ve/", headers=headers, proxies=proxies, timeout=15, verify=False)
         soup = BeautifulSoup(r.text, "html.parser")
-        
         fallback = {}
         usd_div = soup.find("div", {"id": "dolar"})
         eur_div = soup.find("div", {"id": "euro"})
-        
         if usd_div: fallback["USD"] = float(usd_div.find("strong").text.strip().replace(",", "."))
         if eur_div: fallback["EUR"] = float(eur_div.find("strong").text.strip().replace(",", "."))
-        
         if fallback:
             c["rates"], c["date"] = fallback, cache_date
             save_cache()
             return fallback
     except Exception as e:
-        logger.error(f"❌ Fallback fallido: {e}")
+        logger.error(f"Fallback fallido: {e}")
         
-    return c["rates"] # Retorna lo que haya en memoria si todo falla
+    return c["rates"]
 
 
 def fetch_binance_rate():
@@ -255,7 +235,6 @@ def fetch_binance_rate():
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
         payload = {"asset": "USDT", "fiat": "VES", "merchantCheck": False, "page": 1, "publishType": "BUY", "rows": 5, "tradeType": "BUY"}
-        # Binance también usa el proxy si está configurado
         proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
         r = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, proxies=proxies, timeout=10)
         data = r.json()
@@ -282,7 +261,7 @@ async def pedir_suscripcion(update):
     await update.message.reply_text("⚠️ Suscríbete al canal para usar el bot.", reply_markup=keyboard)
 
 
-# ── Comandos Públicos (Sin cambios en lógica) ──
+# ── Comandos Públicos ──
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _guard(update, context): return
     if es_privado(update) and not await check_suscripcion(update.effective_user.id, context):
@@ -309,15 +288,11 @@ async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cantidad = float(args[0].replace(",", "."))
         moneda = args[1].lower() if len(args) > 1 else "usd"
-        if moneda in ("eur", "euro", "€"):
-            tasa = fetch_bcv_rates().get("EUR")
-        elif moneda in ("usdt", "binance"):
-            tasa = fetch_binance_rate()
-        else:
-            tasa = fetch_bcv_rates().get("USD")
+        if moneda in ("eur", "euro", "€"): tasa = fetch_bcv_rates().get("EUR")
+        elif moneda in ("usdt", "binance"): tasa = fetch_binance_rate()
+        else: tasa = fetch_bcv_rates().get("USD")
         await update.message.reply_text(f"Resultado: Bs. {format_number(cantidad * tasa)}")
-    except:
-        await update.message.reply_text("❌ Error en cálculo.")
+    except: await update.message.reply_text("❌ Error en cálculo.")
 
 async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _guard(update, context): return
@@ -329,23 +304,18 @@ async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cantidad = float(args[0].replace(",", "."))
         moneda = args[1].lower() if len(args) > 1 else "usd"
-        if moneda in ("eur", "euro", "€"):
-            tasa = fetch_bcv_rates().get("EUR")
-        elif moneda in ("usdt", "binance"):
-            tasa = fetch_binance_rate()
-        else:
-            tasa = fetch_bcv_rates().get("USD")
+        if moneda in ("eur", "euro", "€"): tasa = fetch_bcv_rates().get("EUR")
+        elif moneda in ("usdt", "binance"): tasa = fetch_binance_rate()
+        else: tasa = fetch_bcv_rates().get("USD")
         await update.message.reply_text(f"Resultado: {format_number(cantidad / tasa)}")
-    except:
-        await update.message.reply_text("❌ Error en conversión.")
+    except: await update.message.reply_text("❌ Error en conversión.")
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if await check_suscripcion(query.from_user.id, context):
         await query.edit_message_text("✅ Verificado. Ya puedes usar los comandos.")
-    else:
-        await query.answer("❌ Aún no estás suscrito.", show_alert=True)
+    else: await query.answer("❌ Aún no estás suscrito.", show_alert=True)
 
 
 # ── Panel Admin ──
@@ -359,6 +329,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "admin_global": return ESPERANDO_MSG_GLOBAL
     if query.data == "admin_usuario": return ESPERANDO_USUARIO
+    return ConversationHandler.END
+
+async def cancelar_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Operación cancelada.")
     return ConversationHandler.END
 
 async def recibir_msg_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,49 +372,15 @@ async def settasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ──
-def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    threading.Thread(target=run_http_server, daemon=True).start()
-    load_cache()
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bcv", bcv))
-    app.add_handler(CommandHandler("calcular", calcular))
-    app.add_handler(CommandHandler("convertir", convertir))
-    app.add_handler(CommandHandler("settasa", settasa))
-    app.add_handler(CommandHandler("banear", banear))
-    app.add_handler(CommandHandler("desbanear", desbanear))
-    app.add_handler(CommandHandler("baneados", lista_baneados))
-    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("gfa", gfa)],
-        states={
-            ADMIN_MENU: [CallbackQueryHandler(admin_callback, pattern="^admin_")],
-            ESPERANDO_MSG_GLOBAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_global)],
-            ESPERANDO_USUARIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_usuario_destino)],
-            ESPERANDO_MSG_USUARIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_usuario)],
-        },
-        fallbacks=[CommandHandler("cancelar", lambda u,c: ConversationHandler.END)]
-    ))
-    app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
-    app.run_polling(poll_interval=2.0)
-
 if __name__ == "__main__":
     load_cache()
-    
-    # Hilo para el servidor HTTP (Evita que Render mate el proceso)
     threading.Thread(target=run_http_server, daemon=True).start()
     
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logger.error("No se encontró TELEGRAM_BOT_TOKEN")
-        exit(1)
+    if not token: exit(1)
 
-    # Construcción de la aplicación
     app = Application.builder().token(token).build()
 
-    # Comandos públicos
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("settasa",   settasa))
     app.add_handler(CommandHandler("bcv",       bcv))
@@ -451,7 +391,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("baneados",  lista_baneados))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
 
-    # Panel Admin
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("gfa", gfa)],
         states={
@@ -474,6 +413,5 @@ if __name__ == "__main__":
     app.add_handler(admin_conv)
     app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
 
-    # Ejecución estable
     logger.info("Bot en marcha...")
     app.run_polling(drop_pending_updates=True)
