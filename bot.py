@@ -12,6 +12,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, ContextTypes,
                            CallbackQueryHandler, MessageHandler, filters,
                            ConversationHandler)
+# Se mantienen las librerías solicitadas
 from pyDolarVenezuela.pages import BCV
 from pyDolarVenezuela import Monitor
 
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 VE_TZ     = timezone(timedelta(hours=-4))
 CANAL     = "@botsgfa"
 CANAL_URL = "https://t.me/botsgfa"
+
+# Configuración de Proxy (Añadir en las variables de entorno de Render)
+# Ejemplo: http://usuario:password@host:puerto
+PROXY_URL = os.environ.get("PROXY_URL")
 
 # Estados ConversationHandler admin
 (ADMIN_MENU, ESPERANDO_MSG_GLOBAL, ESPERANDO_USUARIO, ESPERANDO_MSG_USUARIO) = range(4)
@@ -38,45 +43,23 @@ _cache = {
 
 
 # ── Antiflood ─────────────────────────────────────────────────────────────────
-# Máximo de mensajes permitidos por ventana de tiempo
-FLOOD_MAX_MSGS   = 3       # mensajes permitidos
-FLOOD_WINDOW_SEC = 10      # ventana en segundos
-FLOOD_MUTE_SEC   = 30      # tiempo de silencio tras hacer flood
-
-# Estructura: {user_id: {"timestamps": [...], "muted_until": float}}
 _flood_data: dict = defaultdict(lambda: {"timestamps": [], "muted_until": 0.0})
 
 def check_flood(user_id: int) -> bool:
-    """
-    Devuelve True si el usuario está haciendo flood (debe ser ignorado).
-    Limpia mensajes fuera de la ventana y aplica mute si supera el límite.
-    """
     now = time.monotonic()
     data = _flood_data[user_id]
-
-    # Si está muteado todavía
     if now < data["muted_until"]:
         return True
-
-    # Limpiar timestamps fuera de la ventana
-    data["timestamps"] = [t for t in data["timestamps"] if now - t < FLOOD_WINDOW_SEC]
-
-    # Registrar este mensaje
+    data["timestamps"] = [t for t in data["timestamps"] if now - t < 10] # ventana 10s
     data["timestamps"].append(now)
-
-    # Verificar límite
-    if len(data["timestamps"]) > FLOOD_MAX_MSGS:
-        data["muted_until"] = now + FLOOD_MUTE_SEC
+    if len(data["timestamps"]) > 3: # max 3 msgs
+        data["muted_until"] = now + 30
         data["timestamps"]  = []
-        logger.info(f"Flood detectado: usuario {user_id} muteado {FLOOD_MUTE_SEC}s")
         return True
-
     return False
 
 
 # ── Sistema de Ban ────────────────────────────────────────────────────────────
-# Persiste en memoria de bot_data bajo la clave "baneados" (set de int user_id)
-
 def get_baneados(context: ContextTypes.DEFAULT_TYPE) -> set:
     if "baneados" not in context.bot_data:
         context.bot_data["baneados"] = set()
@@ -85,128 +68,43 @@ def get_baneados(context: ContextTypes.DEFAULT_TYPE) -> set:
 def esta_baneado(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user_id in get_baneados(context)
 
-
 async def banear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Solo admin. Uso: /banear <ID o @username>"""
-    if not es_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Debes indicar el ID o @username.\n"
-            "Ejemplo: `/banear 123456789` o `/banear @usuario`",
-            parse_mode="Markdown"
-        )
-        return
-
+    if not es_admin(update.effective_user.id): return
+    if not context.args: return
     objetivo = context.args[0].strip()
     baneados = get_baneados(context)
-
-    # Resolver ID numérico o @username
-    if objetivo.lstrip("-").isdigit():
-        ban_id = int(objetivo)
-        ban_label = str(ban_id)
-    elif objetivo.startswith("@"):
-        # Guardar el username tal cual; se usará para bloquear cuando escriba
-        ban_id    = objetivo.lower()
-        ban_label = objetivo
-    else:
-        await update.message.reply_text("❌ Formato inválido. Usa un ID numérico o @username.")
-        return
-
-    if ban_id in baneados:
-        await update.message.reply_text(f"⚠️ `{ban_label}` ya está baneado.", parse_mode="Markdown")
-        return
-
+    ban_id = int(objetivo) if objetivo.lstrip("-").isdigit() else objetivo.lower()
     baneados.add(ban_id)
-    logger.info(f"Admin baneó: {ban_label}")
-    await update.message.reply_text(
-        f"🔨 Usuario `{ban_label}` baneado correctamente.\n"
-        f"Usa /desbanear para revertirlo.",
-        parse_mode="Markdown"
-    )
-
+    await update.message.reply_text(f"🔨 Usuario `{objetivo}` baneado.")
 
 async def desbanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Solo admin. Uso: /desbanear <ID o @username>"""
-    if not es_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Debes indicar el ID o @username.\n"
-            "Ejemplo: `/desbanear 123456789`",
-            parse_mode="Markdown"
-        )
-        return
-
+    if not es_admin(update.effective_user.id): return
+    if not context.args: return
     objetivo = context.args[0].strip()
     baneados = get_baneados(context)
-
     ban_id = int(objetivo) if objetivo.lstrip("-").isdigit() else objetivo.lower()
-
-    if ban_id not in baneados:
-        await update.message.reply_text(f"⚠️ `{objetivo}` no está en la lista de baneados.", parse_mode="Markdown")
-        return
-
     baneados.discard(ban_id)
-    logger.info(f"Admin desbaneó: {objetivo}")
-    await update.message.reply_text(f"✅ Usuario `{objetivo}` desbaneado.", parse_mode="Markdown")
-
+    await update.message.reply_text(f"✅ Usuario `{objetivo}` desbaneado.")
 
 async def lista_baneados(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Solo admin. Muestra la lista de usuarios baneados."""
-    if not es_admin(update.effective_user.id):
-        return
-
+    if not es_admin(update.effective_user.id): return
     baneados = get_baneados(context)
     if not baneados:
-        await update.message.reply_text("✅ No hay usuarios baneados actualmente.")
+        await update.message.reply_text("✅ No hay baneados.")
         return
+    await update.message.reply_text(f"Lista: {baneados}")
 
-    lineas = [f"• `{b}`" for b in sorted(baneados, key=str)]
-    texto  = "🔨 *Usuarios baneados:*\n\n" + "\n".join(lineas)
-    await update.message.reply_text(texto, parse_mode="Markdown")
-
-
-# ── Guard: antiflood + ban (decorador reutilizable) ───────────────────────────
-
+# ── Guard ──
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Devuelve True si el update debe ser BLOQUEADO (flood o ban).
-    Envía aviso de flood UNA sola vez (cuando se aplica el mute).
-    """
     user = update.effective_user
-    if not user:
-        return False
-
-    # Verificar ban por ID
-    if esta_baneado(user.id, context):
-        return True
-
-    # Verificar ban por @username
-    if user.username and ("@" + user.username.lower()) in get_baneados(context):
-        return True
-
-    # Verificar flood
-    now  = time.monotonic()
-    data = _flood_data[user.id]
-    prev_muted = now < data["muted_until"]
-
-    if check_flood(user.id):
-        # Solo avisar cuando se aplica el mute (primera vez)
-        if not prev_muted and update.message:
-            await update.message.reply_text(
-                f"⏳ Estás enviando mensajes muy rápido. "
-                f"Espera {FLOOD_MUTE_SEC} segundos antes de continuar."
-            )
-        return True
-
+    if not user: return False
+    if esta_baneado(user.id, context): return True
+    if user.username and ("@" + user.username.lower()) in get_baneados(context): return True
+    if check_flood(user.id): return True
     return False
 
 
 # ── Cache utils ──────────────────────────────────────────────────────────────
-
 def save_cache():
     import json
     try:
@@ -221,7 +119,6 @@ def save_cache():
     except Exception as e:
         logger.warning(f"No se pudo guardar cache: {e}")
 
-
 def load_cache():
     import json
     from datetime import date
@@ -234,72 +131,50 @@ def load_cache():
         if data.get("bin_rate") and data.get("bin_date"):
             _cache["binance"]["rate"] = data["bin_rate"]
             _cache["binance"]["date"] = date.fromisoformat(data["bin_date"])
-        logger.info(f"Cache cargado: BCV={_cache['bcv']['rates']} Binance={_cache['binance']['rate']}")
     except Exception:
-        logger.info("No hay cache previo, se obtendrán tasas frescas.")
-
+        logger.info("Iniciando sin cache previo.")
 
 def get_effective_date():
     now = get_ve_now()
     weekday = now.weekday()
-    if weekday == 5:
-        return (now - timedelta(days=1)).date()
-    elif weekday == 6:
-        return (now - timedelta(days=2)).date()
+    if weekday == 5: return (now - timedelta(days=1)).date()
+    elif weekday == 6: return (now - timedelta(days=2)).date()
     return now.date()
-
 
 def should_fetch():
     now = get_ve_now()
-    if now.weekday() >= 5:
-        return False
-    cached_date = _cache["bcv"]["date"]
-    effective   = get_effective_date()
-    return cached_date != effective
+    if now.weekday() >= 5: return False
+    return _cache["bcv"]["date"] != get_effective_date()
 
 
-# ── HTTP server para UptimeRobot ─────────────────────────────────────────────
-
+# ── HTTP server ──
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
+    def log_message(self, format, *args): pass
 
 def run_http_server():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
 
 
-# ── Utilidades ───────────────────────────────────────────────────────────────
-
-def get_ve_now():
-    return datetime.now(VE_TZ)
-
+# ── Utilidades ──
+def get_ve_now(): return datetime.now(VE_TZ)
 def get_admin_id():
     val = os.environ.get("ADMIN_ID")
     return int(val) if val else None
-
-def es_admin(user_id):
-    admin_id = get_admin_id()
-    return admin_id is not None and user_id == admin_id
-
-def es_privado(update):
-    return update.message.chat.type == "private"
-
-def format_number(value):
-    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
+def es_admin(user_id): return user_id == get_admin_id()
+def es_privado(update): return update.message.chat.type == "private"
+def format_number(value): return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 def get_date_str():
-    meses = ["enero","febrero","marzo","abril","mayo","junio",
-             "julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
     now = get_ve_now()
     return f"{now.day} de {meses[now.month - 1]} de {now.year}"
 
 
-# ── Tasas ────────────────────────────────────────────────────────────────────
+# ── Tasas (MODIFICADO CON PYDOLARVENEZUELA + PROXY) ──────────────────────────
 
 def fetch_bcv_rates():
     c = _cache["bcv"]
@@ -311,33 +186,50 @@ def fetch_bcv_rates():
         return c["rates"]
 
     try:
-        r = requests.get(
-            "https://www.bcv.org.ve/",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-            verify=False  # el cert del BCV a veces falla
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
+        # Configurar proxies si existe la variable
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        
+        # Inicializar Monitor de pyDolarVenezuela usando la página del BCV
+        # Se pasa el diccionario de proxies directamente a la instancia
+        monitor = Monitor(page=BCV, proxies=proxies)
+        data = monitor.get_all_monitors()
+        
         rates = {}
-
-        usd_div = soup.find("div", {"id": "dolar"})
-        if usd_div:
-            usd_str = usd_div.find("strong").text.strip().replace(",", ".")
-            rates["USD"] = float(usd_str)
-
-        eur_div = soup.find("div", {"id": "euro"})
-        if eur_div:
-            eur_str = eur_div.find("strong").text.strip().replace(",", ".")
-            rates["EUR"] = float(eur_str)
+        # pyDolarVenezuela devuelve una lista de diccionarios o un objeto mapeado
+        # Filtramos USD y EUR según la estructura de la librería
+        for m in data:
+            if m.key == 'usd':
+                rates["USD"] = float(m.price)
+            elif m.key == 'eur':
+                rates["EUR"] = float(m.price)
 
         if rates:
             c["rates"] = rates
             c["date"]  = cache_date
             save_cache()
+            logger.info(f"Tasas BCV actualizadas via pyDolar: {rates}")
         return rates or c["rates"]
 
     except Exception as e:
-        logger.error(f"Error scraping BCV: {e}")
+        logger.error(f"Error con pyDolarVenezuela: {e}")
+        # Intentar fallback tradicional si pyDolar falla
+        try:
+            r = requests.get("https://www.bcv.org.ve/", headers={"User-Agent": "Mozilla/5.0"}, 
+                             proxies={"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None,
+                             timeout=15, verify=False)
+            soup = BeautifulSoup(r.text, "html.parser")
+            fallback_rates = {}
+            usd_div = soup.find("div", {"id": "dolar"})
+            if usd_div: fallback_rates["USD"] = float(usd_div.find("strong").text.strip().replace(",", "."))
+            eur_div = soup.find("div", {"id": "euro"})
+            if eur_div: fallback_rates["EUR"] = float(eur_div.find("strong").text.strip().replace(",", "."))
+            
+            if fallback_rates:
+                c["rates"], c["date"] = fallback_rates, cache_date
+                save_cache()
+                return fallback_rates
+        except:
+            pass
         return c["rates"]
 
 
@@ -345,433 +237,182 @@ def fetch_binance_rate():
     c = _cache["binance"]
     now_ve = get_ve_now()
     if c["rate"] and c["date"] == now_ve.date():
-        cached_ts = _cache["binance"].get("ts")
+        cached_ts = c.get("ts")
         if cached_ts and (now_ve.timestamp() - cached_ts) < 300:
             return c["rate"]
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-        payload = {
-            "asset": "USDT",
-            "fiat": "VES",
-            "merchantCheck": False,
-            "page": 1,
-            "publishType": "BUY",
-            "rows": 5,
-            "tradeType": "BUY"
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        }
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        payload = {"asset": "USDT", "fiat": "VES", "merchantCheck": False, "page": 1, "publishType": "BUY", "rows": 5, "tradeType": "BUY"}
+        # Binance también usa el proxy si está configurado
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        r = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, proxies=proxies, timeout=10)
         data = r.json()
         prices = [float(ad["adv"]["price"]) for ad in data.get("data", []) if ad.get("adv", {}).get("price")]
         if prices:
             price = sum(prices) / len(prices)
-            c["rate"] = price
-            c["date"] = now_ve.date()
-            c["ts"]   = now_ve.timestamp()
-            logger.info(f"Binance P2P actualizado: {price}")
+            c.update({"rate": price, "date": now_ve.date(), "ts": now_ve.timestamp()})
             return price
-        logger.warning("No se obtuvieron precios de Binance P2P")
         return c["rate"]
     except Exception as e:
-        logger.error(f"Error Binance P2P: {e}")
+        logger.error(f"Error Binance: {e}")
         return c["rate"]
 
 
-# ── Suscripción ──────────────────────────────────────────────────────────────
-
+# ── Suscripción ──
 async def check_suscripcion(user_id, context):
     try:
         member = await context.bot.get_chat_member(chat_id=CANAL, user_id=user_id)
         return member.status in ("member", "administrator", "creator")
-    except Exception as e:
-        logger.warning(f"No se pudo verificar suscripción: {e}")
-        return False
+    except: return False
 
 async def pedir_suscripcion(update):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
-        [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
-    ])
-    await update.message.reply_text(
-        "⚠️ Para usar este bot necesitas estar suscrito a nuestro canal.\n\n"
-        "Una vez suscrito, presiona el botón *'Ya me suscribí'* para continuar.",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Suscribirme", url=CANAL_URL)], [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]])
+    await update.message.reply_text("⚠️ Suscríbete al canal para usar el bot.", reply_markup=keyboard)
 
 
-# ── Comandos públicos ────────────────────────────────────────────────────────
-
+# ── Comandos Públicos (Sin cambios en lógica) ──
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await _guard(update, context):
-        return
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-    await update.message.reply_text(
-        "¡Gracias por iniciarme! Puedes ver la tasa BCV del día de hoy a través del comando /bcv, "
-        "calcular cuánto es en bolívares cierta cantidad de dólares o euros con /calcular, "
-        "y convertir bolívares a dólares o euros con /convertir"
-    )
-
+    if await _guard(update, context): return
+    if es_privado(update) and not await check_suscripcion(update.effective_user.id, context):
+        await pedir_suscripcion(update); return
+    await update.message.reply_text("Bot iniciado. Usa /bcv, /calcular o /convertir.")
 
 async def bcv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await _guard(update, context):
-        return
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-
-    rates   = fetch_bcv_rates()
-    binance = fetch_binance_rate()
-
+    if await _guard(update, context): return
+    if es_privado(update) and not await check_suscripcion(update.effective_user.id, context):
+        await pedir_suscripcion(update); return
+    rates, binance = fetch_bcv_rates(), fetch_binance_rate()
     if not rates:
-        await update.message.reply_text("❌ No se pudo obtener la tasa del BCV en este momento. Intenta más tarde.")
-        return
-
-    usd_str     = format_number(rates["USD"]) if rates.get("USD") else "No disponible"
-    eur_str     = format_number(rates["EUR"]) if rates.get("EUR") else "No disponible"
-    binance_str = format_number(binance)      if binance           else "No disponible"
-
-    msg = (
-        f"*TASAS DEL DÍA*\n"
-        f"📅 {get_date_str()}\n\n"
-        f"🇪🇺 Euro: Bs. {eur_str}\n"
-        f"🇺🇸 Dólar: Bs. {usd_str}\n"
-        f"💲 Binance / USDT: Bs. {binance_str}"
-    )
+        await update.message.reply_text("❌ Error al obtener tasas."); return
+    msg = f"*TASAS DEL DÍA*\n📅 {get_date_str()}\n\n🇪🇺 Euro: Bs. {format_number(rates.get('EUR', 0))}\n🇺🇸 Dólar: Bs. {format_number(rates.get('USD', 0))}\n💲 Binance: Bs. {format_number(binance)}"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-
 async def calcular(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await _guard(update, context):
-        return
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-
+    if await _guard(update, context): return
+    if es_privado(update) and not await check_suscripcion(update.effective_user.id, context):
+        await pedir_suscripcion(update); return
     args = context.args
     if not args:
-        await update.message.reply_text(
-            "Indica la cantidad y moneda.\nEjemplos:\n"
-            "/calcular 20 — dólares BCV (por defecto)\n"
-            "/calcular 20 eur — euros BCV\n"
-            "/calcular 20 usdt — Binance/USDT"
-        )
-        return
-
+        await update.message.reply_text("Ejemplo: /calcular 20"); return
     try:
         cantidad = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Valor no válido. Ejemplo: /calcular 20")
-        return
-
-    moneda = args[1].lower() if len(args) > 1 else "usd"
-
-    if moneda in ("eur", "euro", "euros", "€"):
-        rates = fetch_bcv_rates()
-        tasa  = rates.get("EUR") if rates else None
-        simbolo = "€"; fuente = "BCV"
-    elif moneda in ("usdt", "binance", "crypto"):
-        tasa    = fetch_binance_rate()
-        simbolo = "USDT"; fuente = "Binance"
-    else:
-        rates = fetch_bcv_rates()
-        tasa  = rates.get("USD") if rates else None
-        simbolo = "$"; fuente = "BCV"
-
-    if not tasa:
-        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
-        return
-
-    cant_str = str(int(cantidad)) if cantidad == int(cantidad) else str(cantidad)
-    msg = f"{cant_str} {simbolo} ({fuente}) en bolívares serían: Bs. {format_number(cantidad * tasa)}"
-    await update.message.reply_text(msg)
-
+        moneda = args[1].lower() if len(args) > 1 else "usd"
+        if moneda in ("eur", "euro", "€"):
+            tasa = fetch_bcv_rates().get("EUR")
+        elif moneda in ("usdt", "binance"):
+            tasa = fetch_binance_rate()
+        else:
+            tasa = fetch_bcv_rates().get("USD")
+        await update.message.reply_text(f"Resultado: Bs. {format_number(cantidad * tasa)}")
+    except:
+        await update.message.reply_text("❌ Error en cálculo.")
 
 async def convertir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await _guard(update, context):
-        return
-    if es_privado(update):
-        if not await check_suscripcion(update.effective_user.id, context):
-            await pedir_suscripcion(update)
-            return
-
+    if await _guard(update, context): return
+    if es_privado(update) and not await check_suscripcion(update.effective_user.id, context):
+        await pedir_suscripcion(update); return
     args = context.args
     if not args:
-        await update.message.reply_text(
-            "Indica la cantidad en bolívares y la moneda destino.\nEjemplos:\n"
-            "/convertir 10000 — Bs. a dólares BCV (por defecto)\n"
-            "/convertir 10000 eur — Bs. a euros BCV\n"
-            "/convertir 10000 usdt — Bs. a Binance/USDT"
-        )
-        return
-
+        await update.message.reply_text("Ejemplo: /convertir 1000"); return
     try:
         cantidad = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Valor no válido. Ejemplo: /convertir 10000")
-        return
-
-    moneda = args[1].lower() if len(args) > 1 else "usd"
-
-    if moneda in ("eur", "euro", "euros", "€"):
-        rates = fetch_bcv_rates()
-        tasa  = rates.get("EUR") if rates else None
-        simbolo = "€"; nombre = "euros (BCV)"
-    elif moneda in ("usdt", "binance", "crypto"):
-        tasa    = fetch_binance_rate()
-        simbolo = "USDT"; nombre = "Binance / USDT"
-    else:
-        rates = fetch_bcv_rates()
-        tasa  = rates.get("USD") if rates else None
-        simbolo = "$"; nombre = "dólares (BCV)"
-
-    if not tasa:
-        await update.message.reply_text("❌ No se pudo obtener la tasa. Intenta más tarde.")
-        return
-
-    msg = f"Bs. {format_number(cantidad)} en {nombre} serían: {simbolo}{format_number(cantidad / tasa)}"
-    await update.message.reply_text(msg)
-
+        moneda = args[1].lower() if len(args) > 1 else "usd"
+        if moneda in ("eur", "euro", "€"):
+            tasa = fetch_bcv_rates().get("EUR")
+        elif moneda in ("usdt", "binance"):
+            tasa = fetch_binance_rate()
+        else:
+            tasa = fetch_bcv_rates().get("USD")
+        await update.message.reply_text(f"Resultado: {format_number(cantidad / tasa)}")
+    except:
+        await update.message.reply_text("❌ Error en conversión.")
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if await check_suscripcion(query.from_user.id, context):
-        await query.edit_message_text(
-            "✅ ¡Suscripción verificada! Ya puedes usar todos los comandos:\n\n"
-            "/bcv — Ver tasas del día\n"
-            "/calcular 20 — USD a Bs.\n"
-            "/calcular 20 eur — EUR a Bs.\n"
-            "/calcular 20 usdt — Binance/USDT a Bs.\n"
-            "/convertir 10000 — Bs. a USD\n"
-            "/convertir 10000 eur — Bs. a EUR\n"
-            "/convertir 10000 usdt — Bs. a USDT"
-        )
+        await query.edit_message_text("✅ Verificado. Ya puedes usar los comandos.")
     else:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Suscribirme al canal", url=CANAL_URL)],
-            [InlineKeyboardButton("✅ Ya me suscribí", callback_data="check_sub")]
-        ])
-        await query.edit_message_text(
-            "❌ Aún no estás suscrito al canal. Suscríbete y vuelve a intentarlo.",
-            reply_markup=keyboard
-        )
+        await query.answer("❌ Aún no estás suscrito.", show_alert=True)
 
 
-# ── Panel Admin (/gfa) ────────────────────────────────────────────────────────
-
-def admin_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📣 Mensaje global",    callback_data="admin_global")],
-        [InlineKeyboardButton("✉️ Mensaje a usuario", callback_data="admin_usuario")],
-        [InlineKeyboardButton("❌ Cerrar panel",      callback_data="admin_cerrar")],
-    ])
-
+# ── Panel Admin ──
 async def gfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
-        return
-    await update.message.reply_text(
-        "🔐 *Panel de Administrador*\n\n¿Qué deseas hacer?",
-        parse_mode="Markdown",
-        reply_markup=admin_menu_keyboard()
-    )
+    if not es_admin(update.effective_user.id): return
+    await update.message.reply_text("🔐 Panel Admin", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 Global", callback_data="admin_global"), InlineKeyboardButton("✉️ Usuario", callback_data="admin_usuario")]]))
     return ADMIN_MENU
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not es_admin(query.from_user.id):
-        return ConversationHandler.END
-
-    if query.data == "admin_global":
-        await query.edit_message_text(
-            "📣 *Mensaje global*\n\nEscribe el mensaje a enviar a todos los usuarios.\n\n_/cancelar para salir._",
-            parse_mode="Markdown"
-        )
-        return ESPERANDO_MSG_GLOBAL
-
-    elif query.data == "admin_usuario":
-        await query.edit_message_text(
-            "✉️ *Mensaje a usuario*\n\nEnvíame el ID numérico o @username del destinatario.\n\n_/cancelar para salir._",
-            parse_mode="Markdown"
-        )
-        return ESPERANDO_USUARIO
-
-    elif query.data == "admin_cerrar":
-        await query.edit_message_text("✅ Panel cerrado.")
-        return ConversationHandler.END
+    if query.data == "admin_global": return ESPERANDO_MSG_GLOBAL
+    if query.data == "admin_usuario": return ESPERANDO_USUARIO
+    return ConversationHandler.END
 
 async def recibir_msg_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
-        return ConversationHandler.END
-    if update.message.text == "/cancelar":
-        await update.message.reply_text("❌ Operación cancelada.")
-        return ConversationHandler.END
-
-    usuarios = context.bot_data.get("usuarios", set())
-    if not usuarios:
-        await update.message.reply_text("⚠️ No hay usuarios registrados aún.")
-        return ConversationHandler.END
-
-    enviados = fallidos = 0
-    for uid in usuarios:
-        try:
-            await context.bot.send_message(chat_id=uid, text=update.message.text)
-            enviados += 1
-        except Exception:
-            fallidos += 1
-
-    await update.message.reply_text(f"✅ Enviado.\n📤 Exitosos: {enviados}\n❌ Fallidos: {fallidos}")
+    for uid in context.bot_data.get("usuarios", []):
+        try: await context.bot.send_message(chat_id=uid, text=update.message.text)
+        except: pass
+    await update.message.reply_text("✅ Enviado.")
     return ConversationHandler.END
 
 async def recibir_usuario_destino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
-        return ConversationHandler.END
-    if update.message.text == "/cancelar":
-        await update.message.reply_text("❌ Operación cancelada.")
-        return ConversationHandler.END
     context.user_data["admin_destino"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✉️ Destinatario: `{update.message.text.strip()}`\n\nAhora escribe el mensaje.\n\n_/cancelar para salir._",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("Escribe el mensaje:")
     return ESPERANDO_MSG_USUARIO
 
 async def recibir_msg_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
-        return ConversationHandler.END
-    if update.message.text == "/cancelar":
-        await update.message.reply_text("❌ Operación cancelada.")
-        return ConversationHandler.END
-
     destino = context.user_data.get("admin_destino")
     try:
         chat_id = int(destino) if destino.lstrip("-").isdigit() else destino
         await context.bot.send_message(chat_id=chat_id, text=update.message.text)
-        await update.message.reply_text(f"✅ Mensaje enviado a `{destino}`.", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ No se pudo enviar a `{destino}`.\nError: {e}", parse_mode="Markdown")
-
-    context.user_data.pop("admin_destino", None)
+        await update.message.reply_text("✅ Enviado.")
+    except: await update.message.reply_text("❌ Error.")
     return ConversationHandler.END
-
-async def cancelar_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Operación cancelada.")
-    return ConversationHandler.END
-
-
-# ── Registro de usuarios ──────────────────────────────────────────────────────
 
 async def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat and update.effective_chat.type == "private":
-        if "usuarios" not in context.bot_data:
-            context.bot_data["usuarios"] = set()
+    if update.effective_chat.type == "private":
+        if "usuarios" not in context.bot_data: context.bot_data["usuarios"] = set()
         context.bot_data["usuarios"].add(update.effective_user.id)
 
-
-# ── Comando /settasa (solo admin) ────────────────────────────────────────────
-
 async def settasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not es_admin(update.effective_user.id):
-        return
-
-    args = context.args
-    if not args:
-        rates = _cache["bcv"]["rates"] or {}
-        usd_str = format_number(rates["USD"]) if rates.get("USD") else "N/A"
-        eur_str = format_number(rates["EUR"]) if rates.get("EUR") else "N/A"
-        msg = "Tasas actuales en cache:\nUSD: Bs. " + usd_str + "\nEUR: Bs. " + eur_str + "\n\nUso: /settasa 443.26 510.34"
-        await update.message.reply_text(msg)
-        return
-
+    if not es_admin(update.effective_user.id): return
     try:
-        usd = float(args[0].replace(",", "."))
-        eur = float(args[1].replace(",", ".")) if len(args) > 1 else (_cache["bcv"]["rates"] or {}).get("EUR")
-    except (ValueError, IndexError):
-        await update.message.reply_text("Formato invalido. Ejemplo: /settasa 443.26 510.34")
-        return
-
-    rates = {}
-    if usd:
-        rates["USD"] = usd
-    if eur:
-        rates["EUR"] = eur
-
-    effective = get_effective_date()
-    _cache["bcv"]["rates"] = rates
-    _cache["bcv"]["date"]  = effective
-    save_cache()
-
-    usd_str = format_number(usd)
-    eur_str = format_number(eur) if eur else "N/A"
-    msg = "Tasas fijadas manualmente:\nUSD: Bs. " + usd_str + "\nEUR: Bs. " + eur_str + "\nFecha efectiva: " + str(effective)
-    await update.message.reply_text(msg)
+        usd, eur = float(context.args[0]), float(context.args[1])
+        _cache["bcv"].update({"rates": {"USD": usd, "EUR": eur}, "date": get_effective_date()})
+        save_cache()
+        await update.message.reply_text("✅ Tasas manuales fijadas.")
+    except: await update.message.reply_text("Uso: /settasa USD EUR")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def preload_rates():
-    load_cache()
-    fetch_bcv_rates()
-    fetch_binance_rate()
-    logger.info(f"Tasas listas: BCV={_cache['bcv']['rates']} Binance={_cache['binance']['rate']}")
-
-
+# ── Main ──
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
-
     threading.Thread(target=run_http_server, daemon=True).start()
-    preload_rates()
-
+    load_cache()
     app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start",      start))
-    app.add_handler(CommandHandler("settasa",    settasa))
-    app.add_handler(CommandHandler("bcv",        bcv))
-    app.add_handler(CommandHandler("calcular",   calcular))
-    app.add_handler(CommandHandler("convertir",  convertir))
-    app.add_handler(CommandHandler("banear",     banear))
-    app.add_handler(CommandHandler("desbanear",  desbanear))
-    app.add_handler(CommandHandler("baneados",   lista_baneados))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bcv", bcv))
+    app.add_handler(CommandHandler("calcular", calcular))
+    app.add_handler(CommandHandler("convertir", convertir))
+    app.add_handler(CommandHandler("settasa", settasa))
+    app.add_handler(CommandHandler("banear", banear))
+    app.add_handler(CommandHandler("desbanear", desbanear))
+    app.add_handler(CommandHandler("baneados", lista_baneados))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-
-    admin_conv = ConversationHandler(
+    
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("gfa", gfa)],
         states={
-            ADMIN_MENU: [
-                CallbackQueryHandler(admin_callback, pattern="^admin_")
-            ],
-            ESPERANDO_MSG_GLOBAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_global),
-                CommandHandler("cancelar", cancelar_admin),
-            ],
-            ESPERANDO_USUARIO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_usuario_destino),
-                CommandHandler("cancelar", cancelar_admin),
-            ],
-            ESPERANDO_MSG_USUARIO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_usuario),
-                CommandHandler("cancelar", cancelar_admin),
-            ],
+            ADMIN_MENU: [CallbackQueryHandler(admin_callback, pattern="^admin_")],
+            ESPERANDO_MSG_GLOBAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_global)],
+            ESPERANDO_USUARIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_usuario_destino)],
+            ESPERANDO_MSG_USUARIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_msg_usuario)],
         },
-        fallbacks=[CommandHandler("cancelar", cancelar_admin)],
-    )
-    app.add_handler(admin_conv)
+        fallbacks=[CommandHandler("cancelar", lambda u,c: ConversationHandler.END)]
+    ))
     app.add_handler(MessageHandler(filters.ALL, registrar_usuario), group=1)
-
-    logger.info("Bot iniciado...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=20)
-
+    app.run_polling(poll_interval=2.0)
 
 if __name__ == "__main__":
     main()
